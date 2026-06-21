@@ -1,6 +1,6 @@
 [project]
 name = "pytest-django-capquery"
-version = "0.1a.0"
+version = "0.0.2a11"
 description = "Pytest capture Django ORM queries"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -12,9 +12,13 @@ classifiers = [
     "Framework :: Pytest",
 ]
 
+
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["uv_build >= 0.11.7, <0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name="capquery"
 
 [project.entry-points.pytest11]
 django-capquery = "pytest_django_capquery.plugin"

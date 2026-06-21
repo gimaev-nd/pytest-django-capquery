@@ -77,8 +77,8 @@ wheels = [
 
 [[package]]
 name = "pytest-django-capquery"
-version = "0.1.0"
-source = { virtual = "." }
+version = "0.0.2a11"
+source = { editable = "." }
 dependencies = [
     { name = "pytest" },
     { name = "pytest-django" },
