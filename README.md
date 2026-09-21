@@ -211,9 +211,18 @@ Values are typed (`{t: <type>, v: <value>}`) so that a replay returns exactly th
 same Python objects the test compared during the recording run: `int`, `bool`,
 `float`, `str`, `decimal`, `date`, `time`, `datetime`, `timedelta`, `uuid`,
 `bytes` (base64), `list`, `tuple`, `dict`, `None`. `NaN` / `Infinity` are stored
-as strings. A value the plugin cannot type (say a custom adapter object) makes
+as strings.
+
+A subclass of one of these types is stored as the base type: Django's
+`models.TextChoices` and `models.IntegerChoices`, `enum.StrEnum` and driver
+scalars are subclasses, and PyYAML refuses a subclass of a builtin outright. A
+member of a choice field is therefore written as the value postgres received
+(`{t: str, v: draft}`) — not as the display form the enum prints, and not as the
+object itself. A value the plugin cannot type (say a custom adapter object) makes
 the test uncapturable: it is reported in the summary and runs against the
-database.
+database. A capture that cannot be written is treated the same way, so a value
+the plugin cannot store never ends the session: the previous captures of that
+test are kept.
 
 The hash is computed as
 

@@ -323,7 +323,7 @@ class CapQueryPlugin:
             if self.unstable:
                 write(f"capquery: unstable tests (captures removed): {', '.join(self.unstable)}")
             for nodeid in self.unsupported:
-                write(f"capquery: {nodeid} was not captured, its results hold untypable values")
+                write(f"capquery: {nodeid} was not captured: it holds values capquery cannot store")
         for message in self.warnings:
             write(message)
         write("", flush=False)
@@ -455,7 +455,16 @@ class CapQueryPlugin:
                 f"Run the tests again and the phase will be done for real."
             )
             return
-        status = write_capture(path, ctx.recorded)
+        try:
+            status = write_capture(path, ctx.recorded)
+        except CaptureFileError as exc:
+            # A value capquery could not store must not end the run: write_capture
+            # renders before it writes anything, so the captures of this test are
+            # still the ones of the previous session.  Report it like any other
+            # value capquery cannot store and let the test run for real.
+            ctx.note_unsupported(str(exc))
+            self._note_unsupported(item, ctx)
+            return
         if status == "absent":
             if not ctx.recorded:
                 # nothing to capture: remember that, so the next session does not keep

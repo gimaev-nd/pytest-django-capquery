@@ -21,6 +21,7 @@ from helpers import run_demo, summarize
 
 ORDERS_COUNT = "tests/captures/test_orders.py/test_orders_count.yaml"
 SEQUENCE_TEST = "tests/captures/test_orders.py/test_sequence_starts_from_the_seed.yaml"
+ENUM_CAPTURE = "tests/captures/test_orders.py/test_an_enum_parameter_is_captured.yaml"
 VARIANT_CAPTURE = "tests/captures/test_variant.py/test_variant.yaml"
 
 NO_IGNORED = ("-k", "not ignored")
@@ -62,9 +63,9 @@ def test_the_second_run_replays_and_writes_nothing(pytester, demo, demo_env):
     first = run_demo(pytester)
     assert first.ret == 0, first.stdout
     summary = summarize(first)
-    # one capture per test that queries the database: 15 managed tests, one of them
+    # one capture per test that queries the database: 16 managed tests, one of them
     # (test_without_queries) never queries anything
-    assert summary.created == 14, str(summary)
+    assert summary.created == 15, str(summary)
     assert summary.replayed == 0
     assert summary.missed == 0
     assert summary.executed_postgres > 40, str(summary)
@@ -77,6 +78,11 @@ def test_the_second_run_replays_and_writes_nothing(pytester, demo, demo_env):
     sequence_capture = (Path(demo) / SEQUENCE_TEST).read_text(encoding="utf-8")
     assert 'INSERT INTO "shop_order"' in sequence_capture
     assert "rowcount: 1" in sequence_capture
+    # a query parameter that is a subclass of str (Django's TextChoices) is stored as
+    # the value postgres got, not as the object itself: it cannot be represented
+    enum_capture = (Path(demo) / ENUM_CAPTURE).read_text(encoding="utf-8")
+    assert "{t: str, v: first}" in enum_capture
+    assert "OrderName" not in enum_capture
     recorded = captures_of(demo)
     migrations = (Path(demo) / "captures" / "migrations.yaml").read_text(encoding="utf-8")
 

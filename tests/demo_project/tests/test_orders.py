@@ -19,9 +19,20 @@ import uuid
 import psycopg
 import pytest
 from django.conf import settings
-from django.db import connection
+from django.db import connection, models
 
 from demo.shop.models import Order
+
+
+class OrderName(models.TextChoices):
+    """Django's own str-mixin enum: a member is a ``str``, but not a ``str``.
+
+    A query parameter like this one is the sort of value the plugin has to store in
+    a capture file, and PyYAML has no representer for a subclass of a builtin.
+    """
+
+    FIRST = "first"
+    SECOND = "second"
 
 #: under pytest-xdist the tests are spread over workers, so the ids of the rows a
 #: test created cannot be predicted from the order of the tests in the file
@@ -53,6 +64,16 @@ def test_filter_by_amount(db):
         Order.objects.filter(amount__gte=decimal.Decimal("20")).values_list("name", flat=True)
     )
     assert names == ["second", "third"]
+
+
+def test_an_enum_parameter_is_captured(db):
+    """A query parameter that is a ``str`` subclass, as Django's choices are.
+
+    Recording this statement used to take the whole session down: the value reached
+    PyYAML, which has no representer for a subclass of a builtin.
+    """
+    assert list(Order.objects.filter(name=OrderName.FIRST).values_list("id", flat=True)) == [1]
+    assert Order.objects.filter(name=OrderName.SECOND).count() == 1
 
 
 def test_same_query_after_update_returns_the_next_result(db):

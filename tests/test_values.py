@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import enum
 import uuid
 
 import pytest
 
+from capquery.hashing import query_hash
 from capquery.values import (
     UnsupportedValue,
     decode_row,
@@ -22,6 +24,28 @@ class _DriverWrapper:
 
     def __init__(self, obj):
         self.obj = obj
+
+
+class _Status(str, enum.Enum):
+    """What Django's ``models.TextChoices`` gives you: a ``str``, but not a ``str``."""
+
+    FIRST = "first"
+    SECOND = "second"
+
+    def __str__(self):  # a display form that must never reach a capture file
+        return f"OrderStatus.{self.name}"
+
+
+class _Level(int, enum.Enum):
+    """What Django's ``models.IntegerChoices`` gives you."""
+
+    LOW = 1
+
+
+class _Ratio(float, enum.Enum):
+    """What a ``float`` subclass (``enum.StrEnum``'s siblings, numpy scalars) is."""
+
+    HALF = 0.5
 
 
 VALUES = [
@@ -91,6 +115,50 @@ def test_unsupported_value_raises():
 
     with pytest.raises(UnsupportedValue):
         encode_value(Opaque())
+
+
+def test_a_subclass_of_a_builtin_is_stored_as_its_builtin():
+    """Django's ``TextChoices``/``IntegerChoices`` members are subclasses of a builtin.
+
+    PyYAML resolves its representers by *exact* type, so a subclass has no
+    representer at all (``RepresenterError: cannot represent an object``): a capture
+    file may only ever hold the base type.
+    """
+    payloads = {
+        _Status.FIRST: {"t": "str", "v": "first"},
+        _Level.LOW: {"t": "int", "v": 1},
+        _Ratio.HALF: {"t": "float", "v": 0.5},
+    }
+    for value, expected in payloads.items():
+        payload = encode_value(value)
+        assert payload is not None, "a supported value must always be encodable"
+        assert payload == expected
+        assert type(payload["v"]) is type(expected["v"])
+
+
+def test_a_subclass_keeps_the_value_postgres_got_not_its_display_form():
+    # ``str(TextChoices.DRAFT)`` is a human readable form ("OrderStatus.FIRST" here),
+    # while the text sent to postgres is the underlying string: store that one
+    assert encode_value(_Status.FIRST) == {"t": "str", "v": "first"}
+    assert decode_value(encode_value(_Status.FIRST)) == _Status.FIRST
+
+
+def test_subclasses_are_stripped_inside_parameters_rows_and_containers():
+    assert encode_params([_Status.FIRST, _Level.LOW]) == [
+        {"t": "str", "v": "first"},
+        {"t": "int", "v": 1},
+    ]
+    assert encode_row([_Ratio.HALF]) == [{"t": "float", "v": 0.5}]
+    assert encode_value([_Status.FIRST]) == {"t": "list", "v": [{"t": "str", "v": "first"}]}
+    assert encode_value({"state": _Status.FIRST}) == {
+        "t": "dict",
+        "v": {"state": {"t": "str", "v": "first"}},
+    }
+
+
+def test_a_subclass_hashes_like_its_base_value():
+    """A statement recorded before the subclasses were stripped keeps its hash."""
+    assert query_hash("SELECT %s", [_Status.FIRST]) == query_hash("SELECT %s", ["first"])
 
 
 def test_row_round_trip():

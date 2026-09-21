@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
+import enum
+
 import pytest
 
+from capquery.hashing import query_hash
 from capquery.records import Record
+from capquery.values import encode_params
 from capquery.yaml_io import CaptureFileError, delete_capture, read_capture, render_capture, write_capture
+
+
+class _Status(str, enum.Enum):
+    """A ``str`` subclass, the shape Django's ``models.TextChoices`` has."""
+
+    FIRST = "first"
 
 
 def record(**overrides) -> Record:
@@ -83,6 +93,46 @@ def test_migrations_are_readable(tmp_path):
     path = tmp_path / "migrations.yaml"
     write_capture(path, [record(sql="SELECT app, name FROM django_migrations", hash="aa")])
     assert read_capture(path)[0].hash == "aa"
+
+
+def test_an_enum_parameter_is_written_as_its_value(tmp_path):
+    """``Order.objects.filter(name=OrderStatus.FIRST)`` records a str subclass."""
+    params = encode_params([_Status.FIRST])
+    statement = Record(
+        hash=query_hash("SELECT id FROM shop_order WHERE name = %s", [_Status.FIRST]),
+        n=0,
+        sql="SELECT id FROM shop_order WHERE name = %s",
+        params=params,
+        rowcount=1,
+        columns=["id"],
+        rows=[[{"t": "int", "v": 1}]],
+    )
+    path = tmp_path / "capture.yaml"
+    assert write_capture(path, [statement]) == "created"
+    assert "{t: str, v: first}" in path.read_text(encoding="utf-8")
+    assert read_capture(path) == [statement]
+
+
+def test_a_value_that_cannot_be_serialized_is_reported_not_raised():
+    """A value the encoder could not strip must not escape as a yaml error.
+
+    PyYAML refuses a subclass of a builtin with ``RepresenterError``; raised out of
+    the run it aborts the whole pytest session instead of one capture.
+    """
+    payload = [{"t": "str", "v": _Status.FIRST}]
+    with pytest.raises(CaptureFileError, match="cannot be stored"):
+        render_capture([record(params=payload)])
+
+
+def test_an_unserializable_record_keeps_the_previous_file(tmp_path):
+    path = tmp_path / "capture.yaml"
+    write_capture(path, [record()])
+    before = path.read_text(encoding="utf-8")
+
+    with pytest.raises(CaptureFileError, match="cannot be stored"):
+        write_capture(path, [record(params=[{"t": "str", "v": _Status.FIRST}])])
+
+    assert path.read_text(encoding="utf-8") == before
 
 
 def test_a_malformed_file_is_reported(tmp_path):

@@ -27,7 +27,7 @@ __all__ = ["CaptureFileError", "delete_capture", "read_capture", "render_capture
 
 
 class CaptureFileError(ValueError):
-    """A capture file exists but cannot be parsed."""
+    """A capture file is malformed, or holds a value that cannot be stored."""
 
 
 class _Dumper(yaml.SafeDumper):
@@ -52,16 +52,27 @@ _Dumper.add_representer(list, _represent_list)
 
 
 def render_capture(records: Iterable[Record]) -> str:
-    """Serialize records into the yaml text of a capture file."""
+    """Serialize records into the yaml text of a capture file.
+
+    A value capquery cannot store (anything but the exact builtin types, which
+    :mod:`capquery.values` produces) is reported as a :class:`CaptureFileError`.
+    PyYAML raises ``RepresenterError`` for a subclass of a builtin, and raised out of
+    here it escapes the plugin and aborts the whole pytest session.
+    """
     payload = [record.to_payload() for record in records]
-    return yaml.dump(
-        payload,
-        Dumper=_Dumper,
-        sort_keys=False,
-        allow_unicode=True,
-        default_flow_style=False,
-        width=1000,
-    )
+    try:
+        return yaml.dump(
+            payload,
+            Dumper=_Dumper,
+            sort_keys=False,
+            allow_unicode=True,
+            default_flow_style=False,
+            width=1000,
+        )
+    except yaml.YAMLError as exc:
+        raise CaptureFileError(
+            f"a captured value cannot be stored in a capture file: {exc}"
+        ) from exc
 
 
 def read_capture(path: Path) -> list[Record]:

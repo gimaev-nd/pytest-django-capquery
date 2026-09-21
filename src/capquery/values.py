@@ -5,6 +5,11 @@ A capture file is read by humans during code review, so values are stored as
 Decoding must give back objects of the very same type, so a test compares
 exactly what it compared during the recording run (``Decimal`` stays
 ``Decimal``, ``datetime`` stays ``datetime`` and so on).
+
+Values are stored as the *exact* builtin type: a subclass of ``str``/``int``/
+``float`` — Django's ``models.TextChoices`` and ``models.IntegerChoices``,
+``enum.StrEnum``, a driver scalar — is normalized to its base type, because
+PyYAML resolves its representers by exact type and refuses a subclass outright.
 """
 
 from __future__ import annotations
@@ -13,6 +18,7 @@ import base64
 import datetime
 import decimal
 import math
+import operator
 import uuid
 from typing import Any
 
@@ -31,22 +37,31 @@ class UnsupportedValue(TypeError):
 
 
 def encode_value(value: Any) -> dict | None:
-    """Encode a single value returned by psycopg into a typed pair."""
+    """Encode a single value returned by psycopg into a typed pair.
+
+    A subclass of a builtin is stored as the builtin itself: only the exact type has
+    a representer in PyYAML, and ``v`` holds what postgres received (the text of a
+    ``TextChoices`` member, not its display form).
+    """
     if value is None:
         return None
     # bool must be checked before int: bool is a subclass of int.
     if isinstance(value, bool):
         return {"t": "bool", "v": value}
     if isinstance(value, int):
-        return {"t": "int", "v": value}
+        # operator.index() gives an exact int, never the subclass instance
+        return {"t": "int", "v": operator.index(value)}
     if isinstance(value, float):
         if math.isnan(value):
             return {"t": "float", "v": "nan"}
         if math.isinf(value):
             return {"t": "float", "v": "inf" if value > 0 else "-inf"}
-        return {"t": "float", "v": value}
+        # float.__float__ copies the value out of a subclass as an exact float
+        return {"t": "float", "v": float.__float__(value)}
     if isinstance(value, str):
-        return {"t": "str", "v": value}
+        # str.__str__ is the text postgres received, not the __str__ a class may
+        # override for display (TextChoices.DRAFT prints "ResultStatus.DRAFT")
+        return {"t": "str", "v": str.__str__(value)}
     if isinstance(value, decimal.Decimal):
         return {"t": "decimal", "v": str(value)}
     # datetime before date: datetime is a subclass of date.

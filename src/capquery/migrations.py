@@ -273,13 +273,21 @@ class MigrationsPhase:
 
     def finish_phase(self) -> None:
         """Write the captures collected in record mode and count attempts."""
-        from .yaml_io import write_capture
+        from .yaml_io import CaptureFileError, write_capture
 
         if self._collected and self.recorded_count:
-            status = write_capture(self.plugin.migrations_path, self._collected)
-            self.plugin.counters[f"migrations_{status}"] += 1
-            if status in ("created", "updated"):
-                self.plugin.store.replace_context(str(self.plugin.migrations_path), self._collected)
+            try:
+                status = write_capture(self.plugin.migrations_path, self._collected)
+            except CaptureFileError as exc:
+                # a value capquery cannot store must not end the run: the phase did
+                # happen for real, only its captures are not written
+                self.plugin.warn(f"capquery: the migration phase was not captured: {exc}")
+            else:
+                self.plugin.counters[f"migrations_{status}"] += 1
+                if status in ("created", "updated"):
+                    self.plugin.store.replace_context(
+                        str(self.plugin.migrations_path), self._collected
+                    )
         if self.needs_clean_rerun:
             self.plugin.state.note_regeneration(self.state_key, self.plugin.max_attempts)
         else:
