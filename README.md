@@ -184,43 +184,90 @@ A test module that lives in the rootdir keeps its captures in
 `<rootdir>/captures/`. Test names are sanitized, so two tests can never collide.
 
 ```yaml
-- hash: 4f0b7c1c...   # sha256 of (sql, params)
-  n: 0                # sequence number of this execution of the same (sql, params)
-  sql: SELECT "shop_order"."id", "shop_order"."name" FROM "shop_order" WHERE "shop_order"."id" = %s
-  params: [{t: int, v: 1}]
-  rowcount: 1         # rows of a SELECT, affected rows of a write
-  columns: [id, name]
-  rows:
-    - [{t: int, v: 1}, {t: str, v: first}]
+captures:
+  - hash: 4f0b7c1c...   # sha256 of (sql, params)
+    n: 0                # sequence number of this execution of the same (sql, params)
+    sql: SELECT "shop_order"."id", "shop_order"."name" FROM "shop_order" WHERE "shop_order"."id" = %s
+    schemas: {params: 1, rows: 2}
+    params: [1]
+    rowcount: 1         # rows of a SELECT, affected rows of a write
+    columns: [id, name]
+    rows:
+      - [1, first]
+schemas:
+  1: [int]
+  2: [int, str]
 ```
 
 Writes look exactly the same, with their `RETURNING` rows:
 
 ```yaml
-- hash: 90864b49...
-  n: 0
-  sql: INSERT INTO "shop_order" ("name", "amount") VALUES (%s, %s) RETURNING "shop_order"."id"
-  params: [{t: str, v: fresh}, {t: decimal, v: '1.00'}]
-  rowcount: 1
-  columns: [id]
-  rows:
-    - [{t: int, v: 4}]
+captures:
+  - hash: 90864b49...
+    n: 0
+    sql: INSERT INTO "shop_order" ("name", "amount") VALUES (%s, %s) RETURNING "shop_order"."id"
+    schemas: {params: 1, rows: 2}
+    params: [fresh, '1.00']
+    rowcount: 1
+    columns: [id]
+    rows:
+      - [4]
+schemas:
+  1: [str, decimal]
+  2: [int]
 ```
 
-Values are typed (`{t: <type>, v: <value>}`) so that a replay returns exactly the
-same Python objects the test compared during the recording run: `int`, `bool`,
-`float`, `str`, `decimal`, `date`, `time`, `datetime`, `timedelta`, `uuid`,
-`bytes` (base64), `list`, `tuple`, `dict`, `None`. `NaN` / `Infinity` are stored
-as strings.
+The fields of a capture hold plain data — a code review reads a value, not a
+wrapper — and a schema is the list of the types of one field: one type per
+parameter, one type per column of a row. A capture names the schema of every field
+that holds typed values by id (`schemas: {params: 1, rows: 2}`) and the table at the
+bottom of the file holds each schema once: identical schemas share one id and are
+never repeated.
+
+The types a replay restores are the ones the test compared during the recording run:
+`int`, `bool`, `float`, `str`, `decimal`, `date`, `time`, `datetime`, `timedelta`,
+`uuid`, `bytes` (base64), `list`, `tuple`, `dict`, `None`. `NaN` / `Infinity` are
+stored as strings. A type no piece of data can be told apart from a string
+(`decimal`, the date and time types, `uuid`, `bytes`) comes from the schema alone —
+`'1.00'` is data and `decimal` is its type. A container is described by its kind:
+
+```yaml
+schemas:
+  1: [{list: [int, str]}]      # a parameter that is a list of an int and a str
+  2: [{tuple: [int]}]          # a parameter that is a tuple of one int
+  3: [{dict: {key: int}}]      # a parameter that is a dict whose key holds an int
+```
+
+A null value needs no type of its own: it is written as null data, and a column that
+is null in every row of a capture is described as `null`.
+
+An `executemany` is one capture whose parameters are the parameter sets it was called
+with, so the schema of such a field describes the sets one by one:
+
+```yaml
+captures:
+  - hash: 8bc794b8...
+    n: 0
+    sql: INSERT INTO shop_order (name, amount) VALUES (%s, %s)
+    schemas: {params: 1}
+    params:
+      - [many-one, '1.00']
+      - [many-two, '2.00']
+    rowcount: 2
+    columns: []
+    rows: []
+schemas:
+  1: [[str, decimal], [str, decimal]]
+```
 
 A subclass of one of these types is stored as the base type: Django's
 `models.TextChoices` and `models.IntegerChoices`, `enum.StrEnum` and driver
 scalars are subclasses, and PyYAML refuses a subclass of a builtin outright. A
 member of a choice field is therefore written as the value postgres received
-(`{t: str, v: draft}`) — not as the display form the enum prints, and not as the
-object itself. A value the plugin cannot type (say a custom adapter object) makes
-the test uncapturable: it is reported in the summary and runs against the
-database. A capture that cannot be written is treated the same way, so a value
+(`params: [draft]`, described by `[str]`) — not as the display form the enum prints,
+and not as the object itself. A value the plugin cannot type (say a custom adapter
+object) makes the test uncapturable: it is reported in the summary and runs against
+the database. A capture that cannot be written is treated the same way, so a value
 the plugin cannot store never ends the session: the previous captures of that
 test are kept.
 

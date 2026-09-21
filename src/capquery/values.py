@@ -1,15 +1,17 @@
-"""Typed encoding of database values for capture files.
+"""Typed encoding of database values.
 
-A capture file is read by humans during code review, so values are stored as
-``{t: <type>, v: <value>}`` pairs instead of a lossy ``str()`` representation.
-Decoding must give back objects of the very same type, so a test compares
-exactly what it compared during the recording run (``Decimal`` stays
-``Decimal``, ``datetime`` stays ``datetime`` and so on).
+A value gets an exact type and value pair — ``{t: <type>, v: <value>}`` — because
+decoding has to give back objects of the very same type: a test compares exactly what
+it compared during the recording run (``Decimal`` stays ``Decimal``, ``datetime``
+stays ``datetime`` and so on).  The pair is what the plugin keeps of a value: the query
+hash is computed from the encoded parameters and the in-memory sqlite store keeps them.
+A capture file writes the data of a value and its type separately — the data in the
+field, the type in the schema of that field (:mod:`capquery.schemas`).
 
 Values are stored as the *exact* builtin type: a subclass of ``str``/``int``/
 ``float`` — Django's ``models.TextChoices`` and ``models.IntegerChoices``,
-``enum.StrEnum``, a driver scalar — is normalized to its base type, because
-PyYAML resolves its representers by exact type and refuses a subclass outright.
+``enum.StrEnum``, a driver scalar — is normalized to its base type, because a capture
+file holds no object of a type PyYAML has no representer for.
 """
 
 from __future__ import annotations

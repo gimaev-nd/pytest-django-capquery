@@ -79,9 +79,11 @@ def test_the_second_run_replays_and_writes_nothing(pytester, demo, demo_env):
     assert 'INSERT INTO "shop_order"' in sequence_capture
     assert "rowcount: 1" in sequence_capture
     # a query parameter that is a subclass of str (Django's TextChoices) is stored as
-    # the value postgres got, not as the object itself: it cannot be represented
+    # the value postgres got, not as the object itself
     enum_capture = (Path(demo) / ENUM_CAPTURE).read_text(encoding="utf-8")
-    assert "{t: str, v: first}" in enum_capture
+    enum_payload = yaml.safe_load(enum_capture)
+    assert any(capture["params"] == ["first"] for capture in enum_payload["captures"])
+    assert ["str"] in enum_payload["schemas"].values()
     assert "OrderName" not in enum_capture
     recorded = captures_of(demo)
     migrations = (Path(demo) / "captures" / "migrations.yaml").read_text(encoding="utf-8")

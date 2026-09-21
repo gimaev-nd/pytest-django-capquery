@@ -32,31 +32,6 @@ class Record:
     columns: list = field(default_factory=list)
     rows: list = field(default_factory=list)
 
-    def to_payload(self) -> dict:
-        """Capture file representation (stable field order for a clean diff)."""
-        return {
-            "hash": self.hash,
-            "n": self.n,
-            "sql": self.sql,
-            "params": self.params,
-            "rowcount": self.rowcount,
-            "columns": list(self.columns),
-            "rows": self.rows,
-        }
-
-    @classmethod
-    def from_payload(cls, payload: dict) -> "Record":
-        rowcount = payload.get("rowcount")
-        return cls(
-            hash=payload["hash"],
-            n=int(payload["n"]),
-            sql=payload["sql"],
-            params=payload.get("params") or [],
-            rowcount=None if rowcount is None else int(rowcount),
-            columns=payload.get("columns") or [],
-            rows=payload.get("rows") or [],
-        )
-
     def decoded_rows(self) -> list:
         """Rows as psycopg would have returned them."""
         return [decode_row(row) for row in self.rows]
