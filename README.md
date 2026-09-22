@@ -266,6 +266,13 @@ plugin normalizes what it does hand over. The value stored is what the server re
 | `Binary(b'\x00')` | `b'\x00'` | `BinaryField` |
 | `Text` (a `tsvector`) | the text | `SearchVectorField` |
 
+The plugin is developed and tested against `psycopg` 3, but Django hands the same
+values over in psycopg2's own wrappers and they are recognized the same way, so a
+capture file is the same under either driver: an `inet` parameter arrives as
+`psycopg2.extras.Inet` (its `addr` is the text the server receives, a netmask
+included), and psycopg2's range types have no public `bounds` — the bounds are read
+from their `lower_inc` / `upper_inc` flags.
+
 An `executemany` is one capture whose parameters are the parameter sets it was called
 with, so the schema of such a field describes the sets one by one:
 

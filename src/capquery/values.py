@@ -16,7 +16,9 @@ driver *prepares* for the server is normalized the same way, because Django hand
 cursor an adapter object rather than a plain value for the postgres-only fields:
 ``Jsonb`` (a ``jsonb`` parameter) is stored as the data it wraps, ``ipaddress`` objects
 (an ``inet`` parameter) as their text form, and ``Range`` — as a parameter or in a row —
-as a ``range`` value of its bounds and the bounds' own types.
+as a ``range`` value of its bounds and the bounds' own types.  psycopg2's forms of the
+same values (``psycopg2.extras.Inet``, and range types that expose ``lower_inc`` /
+``upper_inc`` instead of a public ``bounds``) are recognized the same way.
 
     encode_value(Jsonb({"team": "core"}))          -> {"t": "dict", "v": {...}}
     encode_value(ipaddress.ip_address("10.0.0.1")) -> {"t": "str", "v": "10.0.0.1"}
@@ -89,19 +91,41 @@ class RangeValue:
         return hash((self.lower, self.upper, self.bounds))
 
 
+def _bounds_of(value: Any) -> Optional[str]:
+    """The two bound flags of a range as the string postgres writes them.
+
+    ``psycopg`` exposes the bounds themselves (``"[)"``, ``""`` for an empty range),
+    ``psycopg2`` only the flags of the two ends: its range classes have a private
+    ``_bounds`` and public ``lower_inc`` / ``upper_inc``, so the string has to be built
+    from the flags.  ``None`` means "this object carries no bounds at all", i.e. it is
+    not a range.
+    """
+    if bool(getattr(value, "isempty", False)):
+        return ""
+    bounds = getattr(value, "bounds", None)
+    if isinstance(bounds, str) and bounds in RANGE_BOUNDS:
+        return bounds
+    lower_inc = getattr(value, "lower_inc", None)
+    upper_inc = getattr(value, "upper_inc", None)
+    if isinstance(lower_inc, bool) and isinstance(upper_inc, bool):
+        return ("[" if lower_inc else "(") + ("]" if upper_inc else ")")
+    return None
+
+
 def _range_of(value: Any) -> Optional[dict]:
     """The bounds inside a driver range object, or ``None`` when it is not one.
 
     Duck-typed on purpose: ``psycopg``'s ``Range``/``DateRange``/``NumericRange`` and
-    ``psycopg2``'s range types all expose ``lower``, ``upper`` and ``bounds``, and both
-    drivers use ``""`` for an empty range.
+    ``psycopg2``'s range types all expose ``lower`` and ``upper``, and both drivers use
+    ``""`` for an empty range.  Whether an object *is* one is decided by its bounds
+    (:func:`_bounds_of`), not by its class.
     """
     lower = getattr(value, "lower", _NO_PAYLOAD)
     upper = getattr(value, "upper", _NO_PAYLOAD)
-    bounds = getattr(value, "bounds", _NO_PAYLOAD)
-    if lower is _NO_PAYLOAD or upper is _NO_PAYLOAD or not isinstance(bounds, str):
+    if lower is _NO_PAYLOAD or upper is _NO_PAYLOAD:
         return None
-    if bounds and bounds not in RANGE_BOUNDS:
+    bounds = _bounds_of(value)
+    if bounds is None:
         return None
     return {
         "lower": lower,
@@ -112,7 +136,13 @@ def _range_of(value: Any) -> Optional[dict]:
 
 
 def _range_class():
-    """The driver's range class, or ``None`` when no driver is importable."""
+    """The driver's range class, or ``None`` when no driver is importable.
+
+    The *generic* class of each driver is what a capture can be decoded with: it takes
+    the bounds of any range, and psycopg2's ``Range`` compares equal to its
+    ``DateRange``/``NumericRange`` (psycopg's ``Range`` does too, and it is what
+    psycopg itself returns for a range whose bounds it cannot type further).
+    """
     try:
         from psycopg.types.range import Range
 
@@ -120,9 +150,9 @@ def _range_class():
     except Exception:  # noqa: BLE001 - a missing driver is not an error here
         pass
     try:  # psycopg2 exposes the same interface through its range types
-        from psycopg2.extras import NumericRange
+        from psycopg2.extras import Range as Psycopg2Range
 
-        return NumericRange
+        return Psycopg2Range
     except Exception:  # noqa: BLE001
         return None
 
@@ -166,10 +196,17 @@ def _ipaddress_text(value: Any) -> Optional[str]:
 
     Django prepares an ``inet`` parameter with ``ipaddress.ip_address``; storing its
     text form is what the server receives (``inet`` columns are read back as text as
-    well, because Django registers a text loader for them).
+    well, because Django registers a text loader for them).  With psycopg2 Django hands
+    over the driver's own adapter instead, whose ``addr`` is the very text the server
+    receives — a netmask survives it (``"10.0.0.0/24"``), so it is stored as it is.
     """
-    if type(value).__module__ == "ipaddress":
+    module = type(value).__module__
+    if module == "ipaddress":
         return str(value)
+    if module.split(".")[0] == "psycopg2":
+        addr = getattr(value, "addr", None)
+        if isinstance(addr, str):
+            return addr
     return None
 
 

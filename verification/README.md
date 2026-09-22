@@ -10,6 +10,16 @@ capture files of a replayed run do not change*.
 .venv/bin/python verification/run.py --no-control --no-probe   # only the replay path
 ```
 
+The same project is also run with **psycopg2** instead of psycopg 3, because Django
+4.2/5.x runs on either driver and they prepare the postgres-only values differently:
+
+```console
+uv venv .venv-pg2 --python 3.12
+uv pip install --python .venv-pg2/bin/python -e ".[dev]" psycopg2-binary pgserver
+uv pip uninstall --python .venv-pg2/bin/python psycopg
+.venv-pg2/bin/python verification/run_psycopg2.py     # 4 runs of the same suite
+```
+
 `run.py` starts the embedded postgres (`pgserver`), copies `project/` into a work
 directory, runs the suite there `--runs` times and compares the SHA256 of every capture
 file after each run.  It reads the plugin's own report *and* the postgres server log
@@ -42,6 +52,16 @@ the ordinary write paths and 15 tests that use the ORM the way a project does
   file changes, and the captures settle again two runs later
   probe session: 8 tests that hold a value capquery cannot store are reported, write no
   capture file, and the migration phase they force is byte-identical across two sessions
+```
+
+`run_psycopg2.py` runs the same suite on the other driver Django 4.2/5.x supports:
+
+```
+77 managed tests, 79 capture files, runs 1..4                          PASS
+  run 1: 77 captures created, 126 statements executed against postgres, nothing uncapturable
+  runs 2..4: 126 statements replayed, 0 missed, 0 executed against postgres, 0 captures
+             written, migration phase replayed (21 statements), exit code 0
+  every capture file byte-identical to run 1
 ```
 
 The suite is run with a different `PYTHONHASHSEED` per run, so a statement whose
@@ -127,7 +147,37 @@ test.  The 15 tests moved into `tests/test_orm_postgres_values.py`: they are par
 main suite now, and `run 1 created one capture per managed test` fails if any of them
 stops being capturable.
 
-### 3. What is still not cacheable
+### 3. psycopg2's range and `inet` values were not recognized
+
+Django 4.2/5.x runs on psycopg2 as well, and that driver wraps the postgres-only values in
+its own objects instead:
+
+| Query | Parameter or row the driver receives | was |
+| --- | --- | --- |
+| `filter(peer="10.0.0.1")`, `create(peer=…)` | `psycopg2.extras.Inet` | cannot store |
+| `filter(active__overlap=(a, b))`, `create(active=…)` | `psycopg2._range.DateRange` | cannot store |
+| `filter(weight__contained_by=(a, b))` | `psycopg2._range.NumericRange` | cannot store |
+| `Ticket.objects.get(...)`, `values_list("active", flat=True)` | rows hold `psycopg2._range.DateRange` | cannot store |
+
+psycopg2's range classes have no public `bounds` — a private `_bounds` and the flags
+`lower_inc` / `upper_inc` — so the check that decides "this object is a range" (a public
+`bounds` holding one of the four postgres flags) never matched, and `Inet` is not an
+`ipaddress` object either.  Every test of the project that touched a range or an address was
+therefore reported (`was not captured`) and ran against postgres in every session — and
+because such a session always has a test that really goes to the database, the migration
+phase could never be replayed either.  An earlier run of `run_psycopg2.py`: 71 capture
+files, 8 tests uncapturable, `migrations: … 21 recorded`.
+
+**Fixed** by reading the bounds the way the driver that wraps them spells them
+(`capquery.values._bounds_of`: the public `bounds` of psycopg, or the two flags of psycopg2)
+and by recognizing the driver's own `inet` adapter (`capquery.values._ipaddress_text`:
+`Inet.addr` is the text the server receives, a netmask included).  A capture decoded where
+psycopg 3 is not installed is rebuilt as psycopg2's *generic* `Range`, which compares equal
+to its `DateRange`/`NumericRange` (`_range_class`).  `run_psycopg2.py` checks it: 77 of 77
+managed tests captured, then 126 statements replayed, 0 missed, 79 capture files
+byte-identical.
+
+### 4. What is still not cacheable
 
 A value no capture describes: a project's own type that arrives with a dumper of its own
 (the `Pixel` of the probe module), or a postgres type the driver loads into something the
@@ -163,6 +213,7 @@ phase and a rewritten capture file before the test is marked unstable.
 ```
 verification/
   run.py                       orchestrator: runs the project, hashes captures, compares
+  run_psycopg2.py              the same runs on psycopg2 (a venv without psycopg 3)
   project/
     pytest.ini                 DJANGO_SETTINGS_MODULE=demo.settings
     demo/settings.py           connection from CAPQUERY_VERIFY_DB_* environment

@@ -327,3 +327,82 @@ def test_an_object_of_an_unknown_type_is_still_unsupported():
         # duck-typing a range must not swallow anything that happens to be shaped
         # like one: only the four bound flags postgres has are a range
         encode_value(type("Bounds", (), {"lower": 1, "upper": 2, "bounds": "both"})())
+
+
+# -- the same values as psycopg2 prepares them ------------------------------- #
+
+
+class _Psycopg2Range:
+    """psycopg2's range types: no public ``bounds``, only the flags of the two ends.
+
+    ``psycopg2._range.DateRange(lower, upper, "[)")`` sets ``_bounds`` (private),
+    ``lower_inc``/``upper_inc`` and ``isempty``, and that is what an encoder can read.
+    """
+
+    def __init__(self, lower=None, upper=None, bounds="[)", empty=False):
+        self.lower = lower
+        self.upper = upper
+        self.isempty = empty
+        self.lower_inc = not empty and bounds[0] == "["
+        self.upper_inc = not empty and bounds[1] == "]"
+
+    def __repr__(self):
+        return f"_Psycopg2Range({self.lower!r}, {self.upper!r}, {self.lower_inc}, {self.upper_inc})"
+
+
+class _Psycopg2Inet:
+    """``psycopg2.extras.Inet``: the ``inet`` parameter psycopg2 adapts, text in ``addr``.
+
+    The module name is the driver's on purpose: the encoder recognizes the adapter by
+    the driver it belongs to, and this test has to run without psycopg2 installed.
+    """
+
+    __module__ = "psycopg2.extras"
+
+    def __init__(self, addr):
+        self.addr = addr
+
+
+def test_a_psycopg2_range_is_stored_like_a_psycopg_one():
+    """The flags of the two ends are the bounds psycopg3 spells out itself."""
+    payload = encode_value(_Psycopg2Range(datetime.date(2024, 1, 1), datetime.date(2024, 1, 31)))
+    assert payload is not None and payload["t"] == "range"
+    assert payload["v"]["bounds"] == "[)"
+    assert payload == encode_value(
+        _psycopg_range(datetime.date(2024, 1, 1), datetime.date(2024, 1, 31))
+    )
+
+
+def test_a_psycopg2_range_keeps_its_open_bounds():
+    for bounds in ("(]", "()", "[]"):
+        payload = encode_value(_Psycopg2Range(1, 5, bounds=bounds))
+        assert payload is not None and payload["v"]["bounds"] == bounds, bounds
+    payload = encode_value(_Psycopg2Range(None, 5, bounds="(]"))
+    assert payload is not None and payload["v"]["lower"] is None
+    decoded = decode_value(payload)
+    assert (decoded.lower, decoded.upper, decoded.bounds) == (None, 5, "(]")
+
+
+def test_a_psycopg2_empty_range_round_trips():
+    payload = encode_value(_Psycopg2Range(empty=True))
+    assert payload is not None
+    assert payload["v"]["empty"] is True
+    assert payload["v"]["bounds"] == ""
+    assert decode_value(payload).isempty
+
+
+def test_a_psycopg2_inet_adapter_is_stored_as_its_text():
+    """``addr`` is the text postgres receives, a netmask included."""
+    assert encode_value(_Psycopg2Inet("10.0.0.1")) == {"t": "str", "v": "10.0.0.1"}
+    assert encode_value(_Psycopg2Inet("10.0.0.0/24")) == {"t": "str", "v": "10.0.0.0/24"}
+    assert encode_params([_Psycopg2Inet("2001:db8::1")])[0] == {"t": "str", "v": "2001:db8::1"}
+
+
+def test_an_addr_of_a_foreign_object_is_not_an_inet():
+    """Anything that merely carries an ``addr`` is not the driver's adapter."""
+
+    class Stranger:
+        addr = "10.0.0.1"
+
+    with pytest.raises(UnsupportedValue, match="Stranger"):
+        encode_value(Stranger())
