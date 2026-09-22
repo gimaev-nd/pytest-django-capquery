@@ -10,6 +10,7 @@ from typing import Any, Optional
 import pytest
 
 from . import interceptor
+from . import migration_time
 from .interceptor import PASSTHROUGH, RECORD, REPLAY, CaptureContext
 from .migrations import MigrationsPhase
 from .paths import capture_file, migrations_file, state_file
@@ -216,6 +217,7 @@ class CapQueryPlugin:
         self.real_setup_needed = self._needs_real_setup(db_items)
         interceptor.install()
         self.migrations.install()
+        migration_time.reset()
         self._load_store()
 
     def _needs_real_setup(self, db_items: list[pytest.Item]) -> bool:
@@ -408,6 +410,10 @@ class CapQueryPlugin:
                 decision = "unstable"
             elif decision == "save":
                 self._save(item, path, ctx)
+            elif decision == "unsupported":
+                # a test whose statement holds a value capquery cannot store: it always
+                # runs against the database, and the user has to hear about it
+                self._note_unsupported(item, ctx)
             elif ctx.mode == REPLAY and not ctx.misses:
                 self.state.clear_attempts(nodeid)
             for report in reports:

@@ -204,3 +204,126 @@ def test_unknown_type_in_decoding_is_reported():
 def test_malformed_payload_is_reported():
     with pytest.raises(ValueError, match="malformed typed value"):
         decode_value([1, 2])
+
+
+# -- what the driver prepares for postgres-only columns ---------------------- #
+
+
+def _psycopg_json(value):
+    pytest.importorskip("psycopg")
+    from psycopg.types.json import Jsonb
+
+    return Jsonb(value)
+
+
+def _psycopg_range(lower=None, upper=None, bounds="[)", empty=False):
+    pytest.importorskip("psycopg")
+    from psycopg.types.range import Range
+
+    return Range(lower, upper, bounds, empty)
+
+
+def test_a_json_wrapper_is_stored_as_the_data_it_wraps():
+    """Django prepares a ``jsonb`` parameter as ``Jsonb(value)``, not as the value."""
+    assert encode_value(_psycopg_json({"team": "core", "level": 1})) == encode_value(
+        {"team": "core", "level": 1}
+    )
+    assert encode_value(_psycopg_json(["a", None])) == encode_value(["a", None])
+    assert encode_value(_psycopg_json(None)) is None
+    assert encode_params([_psycopg_json({"a": 1})])[0]["t"] == "dict"
+
+
+def test_json_wrappers_of_other_drivers_are_unwrapped_too():
+    """psycopg2 hides the value in ``adapted``; the shape of the pair is the same."""
+    assert encode_value(_DriverWrapper({"a": 1})) == encode_value({"a": 1})
+    wrapper = _DriverWrapper(b"\x00\x01")
+    assert encode_value(wrapper) == {"t": "bytes", "v": "AAE="}  # bytes, not json
+
+
+def test_an_ipaddress_object_is_stored_as_its_text():
+    """Django prepares an ``inet`` parameter with ``ipaddress.ip_address``."""
+    ipaddress = pytest.importorskip("ipaddress")
+
+    assert encode_value(ipaddress.ip_address("10.0.0.1")) == {"t": "str", "v": "10.0.0.1"}
+    assert encode_value(ipaddress.ip_address("2001:db8::1")) == {"t": "str", "v": "2001:db8::1"}
+    assert encode_value(ipaddress.ip_network("10.0.0.0/24")) == {"t": "str", "v": "10.0.0.0/24"}
+
+
+def test_a_range_round_trips_with_its_bounds_and_their_types():
+    value = _psycopg_range(datetime.date(2024, 1, 1), datetime.date(2024, 1, 31))
+    payload = encode_value(value)
+    assert payload is not None and payload["t"] == "range"
+    assert payload["v"]["bounds"] == "[)"
+    decoded = decode_value(payload)
+    assert (decoded.lower, decoded.upper, decoded.bounds) == (
+        datetime.date(2024, 1, 1),
+        datetime.date(2024, 1, 31),
+        "[)",
+    )
+    assert decoded == value
+
+
+def test_a_range_with_unset_bounds_round_trips():
+    value = _psycopg_range(None, decimal.Decimal("20.5"), bounds="(]")
+    payload = encode_value(value)
+    assert payload["v"]["lower"] is None
+    decoded = decode_value(payload)
+    assert (decoded.lower, decoded.upper, decoded.bounds) == (None, decimal.Decimal("20.50"), "(]")
+    assert decoded == value
+
+
+def test_an_empty_range_round_trips():
+    value = _psycopg_range(empty=True)
+    payload = encode_value(value)
+    assert payload["v"]["empty"] is True
+    decoded = decode_value(payload)
+    assert decoded.isempty
+    assert decoded == value
+
+
+def test_a_range_inside_a_container_is_encoded_as_a_range():
+    value = [_psycopg_range(1, 5), (2, "b")]
+    payload = encode_value(value)
+    assert payload["t"] == "list"
+    assert payload["v"][0]["t"] == "range"
+    items = decode_value(payload)
+    assert items[0] == _psycopg_range(1, 5)
+    assert items[1] == (2, "b")
+
+
+def test_a_range_keeps_its_type_in_a_capture_file(tmp_path):
+    """The bounds' types come from the schema, the payload from the data."""
+    from capquery.records import Record
+    from capquery.yaml_io import read_capture, write_capture
+
+    range_value = _psycopg_range(datetime.date(2024, 3, 1), datetime.date(2024, 3, 31))
+    record = Record(
+        hash="9f2c",
+        n=0,
+        sql="SELECT active FROM shop_ticket WHERE id = %s",
+        params=[{"t": "int", "v": 1}],
+        rowcount=1,
+        columns=["active"],
+        rows=[[encode_value(range_value)]],
+    )
+    path = tmp_path / "capture.yaml"
+    write_capture(path, [record])
+    text = path.read_text(encoding="utf-8")
+    assert "{range: {lower: date, upper: date}}" in text
+
+    [read_back] = read_capture(path)
+    decoded = read_back.decoded_rows()[0][0]
+    assert decoded == range_value
+    assert decoded.lower == datetime.date(2024, 3, 1)
+
+
+def test_an_object_of_an_unknown_type_is_still_unsupported():
+    class Opaque:
+        pass
+
+    with pytest.raises(UnsupportedValue, match="Opaque"):
+        encode_value(Opaque())
+    with pytest.raises(UnsupportedValue, match="Bounds"):
+        # duck-typing a range must not swallow anything that happens to be shaped
+        # like one: only the four bound flags postgres has are a range
+        encode_value(type("Bounds", (), {"lower": 1, "upper": 2, "bounds": "both"})())

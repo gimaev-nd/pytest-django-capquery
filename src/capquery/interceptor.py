@@ -22,6 +22,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 
+from . import migration_time
 from .hashing import hash_for
 from .records import Record, record_from_db
 from .statements import is_data_statement
@@ -242,6 +243,9 @@ def _record_result(wrapper, ctx, *, sql, encoded_params, query_hash, n):
     except Exception:
         _reset_buffer(wrapper)
         raise
+    # a capture must not hold the time of the run: the caller sees the normalized rows
+    # too, so a recording run and a replay of it answer with the very same values
+    rows = migration_time.normalize_rows(sql, columns, rows)
     ctx.last_sql = sql
     _set_buffer(wrapper, rows, columns, rowcount)
     _trace("REC", ctx.mode, ctx.key, f"{query_hash[:8]}#{n}", sql.replace("\n", " ")[:90])

@@ -29,7 +29,14 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-__all__ = ["DATA", "SYSTEM", "classify", "is_data_statement", "leading_keyword"]
+__all__ = [
+    "DATA",
+    "SYSTEM",
+    "classify",
+    "is_data_statement",
+    "leading_keyword",
+    "system_tables",
+]
 
 #: Captured and replayed.
 DATA = "data"
@@ -42,6 +49,15 @@ _LEADING_RE = re.compile(
     r"^\s*(?:(?:--[^\n]*\n|/\*.*?\*/)\s*)*\(*\s*([A-Za-z_][A-Za-z_0-9]*)",
     re.DOTALL,
 )
+
+#: A read the *driver* issues to resolve postgres type oids (``psycopg`` asks for the
+#: oids of hstore/citext/… once per process).  Whether it appears does not depend on the
+#: project but on whether the process already resolved that type, so caching one would
+#: make the capture of a phase depend on the process that recorded it: the phase
+#: re-recorded inside a session (a regeneration) would not issue them, the next session
+#: started cold would, and the phase would be redone for real for ever.  They are
+#: metadata reads of a handful of catalogue rows, so they always go to postgres.
+_DRIVER_TYPE_LOOKUP_RE = re.compile(r"(?=.*\bpg_type\b)(?=.*\btyparray\b)", re.IGNORECASE | re.DOTALL)
 
 #: The statement kinds whose result capquery stores and replays.
 _DATA_KEYWORDS = frozenset(
@@ -70,14 +86,19 @@ def leading_keyword(sql: str) -> str:
 
 def classify(sql: str) -> str:
     """Return :data:`DATA` for a capturable statement, :data:`SYSTEM` otherwise."""
-    if leading_keyword(sql) not in _DATA_KEYWORDS:
+    keyword = leading_keyword(sql)
+    if keyword not in _DATA_KEYWORDS:
         return SYSTEM
     if ";" in sql.rstrip().rstrip(";"):
         # more than one statement in one string: the second one may be anything, and
         # capquery only ever looks at the first keyword
         return SYSTEM
+    if keyword in ("select", "with") and _DRIVER_TYPE_LOOKUP_RE.search(sql):
+        # the driver resolving postgres type oids: the statement belongs to the
+        # connection, not to the project (see _DRIVER_TYPE_LOOKUP_RE)
+        return SYSTEM
     target = _write_target(sql)
-    if target is not None and target in _system_tables():
+    if target is not None and target in system_tables():
         return SYSTEM
     return DATA
 
@@ -101,13 +122,15 @@ def _write_target(sql: str) -> Optional[str]:
     return match.group(1).split(".")[-1].strip('"').lower()
 
 
-def _system_tables() -> frozenset:
+def system_tables() -> frozenset:
     """Tables capquery never captures writes of.
 
     ``django_migrations`` is postgres-side bookkeeping of the migration executor:
     every applied migration adds a row with the current timestamp, so the very same
     ``INSERT`` has different parameters on every run.  Recording it would only
-    guarantee a miss on the next replay, so it is executed for real instead.
+    guarantee a miss on the next replay, so it is executed for real instead.  Reads of
+    those tables *are* captured, with a fixed clock in their ``applied`` column
+    (:mod:`capquery.migration_time`).
     """
     global _SYSTEM_TABLES
     if _SYSTEM_TABLES is None:

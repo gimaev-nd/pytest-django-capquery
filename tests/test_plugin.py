@@ -108,6 +108,62 @@ def test_a_capture_that_can_be_written_is_still_saved(tmp_path):
     assert plugin.store.known_context(str(path))
 
 
+class _Hook:
+    """The parts of ``item.ihook`` the retry loop calls."""
+
+    def pytest_runtest_logstart(self, **kwargs):
+        pass
+
+    def pytest_runtest_logreport(self, **kwargs):
+        pass
+
+    def pytest_runtest_logfinish(self, **kwargs):
+        pass
+
+
+def test_an_uncapturable_test_is_reported_instead_of_being_skipped_silently(tmp_path, monkeypatch):
+    """A context that saw a value capquery cannot store is reported.
+
+    The decision ``unsupported`` has to reach ``_note_unsupported``: it is what puts the
+    test into the terminal summary ("was not captured: it holds values capquery cannot
+    store").  It used to fall through every branch of the retry loop, so the test simply
+    never got a capture file and nothing in the output said why.
+    """
+    plugin = _plugin(tmp_path)
+    plugin.enabled = True
+    path = tmp_path / "tests" / "captures" / "test_orders.py" / "test_orders_count.yaml"
+    plugin.capture_paths[_Item.nodeid] = path
+    ctx = CaptureContext(key=str(path), mode=RECORD, store=CaptureStore())
+    ctx.note_unsupported("capquery cannot store values of type psycopg.types.json.Jsonb")
+
+    monkeypatch.setattr(plugin, "_prepare", lambda item, path, attempt: ctx)
+    monkeypatch.setattr("_pytest.runner.runtestprotocol", lambda item, log, nextitem: [])
+
+    item = SimpleNamespace(
+        nodeid=_Item.nodeid,
+        location=("tests/test_orders.py", 0, "test_orders_count"),
+        ihook=_Hook(),
+    )
+    plugin._run_with_retries(item, None)
+
+    assert plugin.unsupported == [_Item.nodeid]
+    assert any("cannot store" in message for message in plugin.warnings)
+    assert not path.exists()
+
+
+class _Hook:
+    """The parts of ``item.ihook`` the retry loop calls."""
+
+    def pytest_runtest_logstart(self, **kwargs):
+        pass
+
+    def pytest_runtest_logreport(self, **kwargs):
+        pass
+
+    def pytest_runtest_logfinish(self, **kwargs):
+        pass
+
+
 def test_an_unstorable_migration_capture_is_reported_instead_of_failing_the_setup(tmp_path):
     """The migration phase is saved from a session fixture, so an exception there
     fails every test of the session rather than one."""

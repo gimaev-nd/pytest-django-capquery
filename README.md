@@ -58,7 +58,7 @@ Every *data* statement is captured and replayed: `SELECT`, `WITH ... SELECT`,
 `executemany` as a whole. Next to the rows, the record stores the row count, which
 is what Django returns from `QuerySet.update()` and `QuerySet.delete()`.
 
-Two groups are never captured; they are executed against postgres every run:
+Three groups are never captured; they are executed against postgres every run:
 
 * **schema DDL** — `CREATE` / `ALTER` / `DROP TABLE` and friends. The test database
   is really created and really gets the schema of the project, so a statement that
@@ -67,12 +67,21 @@ Two groups are never captured; they are executed against postgres every run:
   (`SAVEPOINT`, `RELEASE`, `SET CONSTRAINTS`), maintenance (`VACUUM`, `ANALYZE`),
   administration and anything the plugin does not recognise. Being conservative
   here is on purpose: an unknown statement is never replayed, so it cannot silently
-  lose its side effect.
+  lose its side effect;
+* **the driver resolving postgres type oids** — `psycopg` asks the catalogue for the
+  oid of `hstore`, `citext` and friends (`SELECT oid, typarray FROM pg_type WHERE
+  typname = %s`) once per process. Whether such a statement is issued depends on the
+  process, not on the project: a phase recorded inside a session that already resolved
+  the type would not contain it, and the next session, started cold, would miss it and
+  redo the phase for real — for ever. They are metadata reads of a handful of rows, so
+  they always go to postgres. A read of `pg_type` that is not an oid lookup (`SELECT
+  typname FROM pg_type`) is still a data statement.
 
 Django's own migration bookkeeping (`django_migrations`) belongs to the second
 group even though it is an ordinary `INSERT`: it records *when* a migration was
 applied, so its parameter changes on every run and could never be replayed. Its
-`SELECT`s are still replayed like any other read.
+`SELECT`s are still replayed like any other read, with a fixed clock in their
+`applied` column — see *The migration phase*.
 
 Because writes are replayed, the database does **not** contain what the captures
 say while a replayed test runs. That is the point (no round trip, no transaction
@@ -226,20 +235,36 @@ never repeated.
 
 The types a replay restores are the ones the test compared during the recording run:
 `int`, `bool`, `float`, `str`, `decimal`, `date`, `time`, `datetime`, `timedelta`,
-`uuid`, `bytes` (base64), `list`, `tuple`, `dict`, `None`. `NaN` / `Infinity` are
-stored as strings. A type no piece of data can be told apart from a string
+`uuid`, `bytes` (base64), `list`, `tuple`, `dict`, `range`, `None`. `NaN` / `Infinity`
+are stored as strings. A type no piece of data can be told apart from a string
 (`decimal`, the date and time types, `uuid`, `bytes`) comes from the schema alone —
-`'1.00'` is data and `decimal` is its type. A container is described by its kind:
+`'1.00'` is data and `decimal` is its type. A container is described by its kind, and a
+range by the types of its two bounds:
 
 ```yaml
 schemas:
-  1: [{list: [int, str]}]      # a parameter that is a list of an int and a str
-  2: [{tuple: [int]}]          # a parameter that is a tuple of one int
-  3: [{dict: {key: int}}]      # a parameter that is a dict whose key holds an int
+  1: [{list: [int, str]}]                 # a parameter that is a list of an int and a str
+  2: [{tuple: [int]}]                     # a parameter that is a tuple of one int
+  3: [{dict: {key: int}}]                 # a parameter that is a dict whose key holds an int
+  4: [{range: {lower: date, upper: date}}]  # a parameter that is a range of dates
 ```
 
 A null value needs no type of its own: it is written as null data, and a column that
 is null in every row of a capture is described as `null`.
+
+### What the driver prepares for a postgres column
+
+Django does not hand the cursor a plain Python value for the postgres-only types, so the
+plugin normalizes what it does hand over. The value stored is what the server received:
+
+| What the driver gets | What is stored | Which fields |
+| --- | --- | --- |
+| `Jsonb({'team': 'core'})` | the dict | `JSONField` — an insert, `__contains`, `__exact`, a comparison |
+| `ipaddress.IPv4Address('10.0.0.1')` | `'10.0.0.1'` | `GenericIPAddressField` (`inet`); the column *reads* back as text too |
+| `Range(date(2024, 1, 1), date(2024, 1, 31), '[)')` | `{lower: '2024-01-01', upper: '2024-01-31', bounds: '[)', empty: false}` of a `range` value | `DateRangeField`, `IntegerRangeField`, … — as a parameter and in a row |
+| `Int4(1)` inside an array | `1` | a driver scalar is a subclass of a builtin, and a subclass has no representer in PyYAML |
+| `Binary(b'\x00')` | `b'\x00'` | `BinaryField` |
+| `Text` (a `tsvector`) | the text | `SearchVectorField` |
 
 An `executemany` is one capture whose parameters are the parameter sets it was called
 with, so the schema of such a field describes the sets one by one:
@@ -265,11 +290,19 @@ A subclass of one of these types is stored as the base type: Django's
 scalars are subclasses, and PyYAML refuses a subclass of a builtin outright. A
 member of a choice field is therefore written as the value postgres received
 (`params: [draft]`, described by `[str]`) — not as the display form the enum prints,
-and not as the object itself. A value the plugin cannot type (say a custom adapter
-object) makes the test uncapturable: it is reported in the summary and runs against
-the database. A capture that cannot be written is treated the same way, so a value
-the plugin cannot store never ends the session: the previous captures of that
-test are kept.
+and not as the object itself. A value the plugin cannot type (a project's own type
+that arrives with a dumper of its own, a postgres type the driver loads into
+something no capture describes, say a multirange) makes the test uncapturable: the
+statement runs against the database, the test is listed in the summary —
+
+```text
+capquery: tests/test_orders.py::test_round_trip was not captured: it holds values capquery cannot store
+```
+
+— and no capture file appears for it. Nothing is ever silently dropped: the reason
+(the offending type, or the statement whose rows hold one) is reported next to it. A
+capture that cannot be *written* is treated the same way, so a value the plugin cannot
+store never ends the session: the previous captures of that test are kept.
 
 The hash is computed as
 
@@ -331,6 +364,31 @@ reset with `sqlsequencereset`, so that the ids a *recording* run sees start from
 on every run and captures stay stable. On a database created from scratch there is
 nothing to reset yet (the tables do not exist) — that case is handled silently.
 
+### A fixed clock for `django_migrations`
+
+`django_migrations.applied` holds the moment a migration was applied, i.e. the wall
+clock of the run that applied it, and the executor reads that row back while the phase
+is being captured. Storing the real value made the phase capture reproducible only
+while it was never recorded again — and it *is* recorded again in any session where
+something runs against the database (a test without captures yet, an unstable test, a
+test marked `capquery_ignore`, a test whose values cannot be stored), which rewrote
+`captures/migrations.yaml` with a one-line diff of timestamps on every run. The date of
+a migration means nothing to a test suite, so a capture stores a deterministic one:
+
+```yaml
+    rows:
+      - [1, contenttypes, 0001_initial, '2000-01-01T00:00:00+00:00']
+      - [2, auth, 0001_initial, '2000-01-01T00:00:01+00:00']
+      - [3, auth, 0002_alter_permission_name_max_length, '2000-01-01T00:00:02+00:00']
+```
+
+The first migration of a session is "applied" on 2000-01-01 00:00:00 UTC and every
+migration seen after it one second later, assigned in the order the rows are read —
+which is the order the migrations were applied in — so the same migration gets the same
+moment in every statement and in every run, and a test that reads the table itself sees
+the same values as its replay. Only a read of the bookkeeping table with an `applied`
+column of datetimes is normalized; nothing else is touched.
+
 The post migrate signal (Django's content types and permissions) is never captured
 and always executed for real: it builds its `IN (...)` parameter lists from a
 `set`, so the same statement carries differently ordered parameters in every
@@ -372,6 +430,16 @@ migrations are simply executed for real.
   captured** (the interceptor is suspended while they run), otherwise a replayed
   `sqlsequencereset` would be answered from the cache and would not reset
   anything, and the introspection SELECTs would pollute `migrations.yaml`.
+* **The `applied` column of `django_migrations` is the time of the run.** It is the
+  reason a re-recorded phase capture was never stable (and a phase *is* re-recorded in
+  every session that has a test running against the database), so the phase captures a
+  fixed clock instead of the real time — see *A fixed clock for `django_migrations`*.
+* **The statement set of the phase depends on the process.** `psycopg` resolves the
+  oid of `hstore`/`citext` once per process; a phase re-recorded inside a session that
+  already talked to postgres does not issue those reads, the next session started cold
+  does, misses them and redoes the phase for real — every session, changing the file
+  back and forth. They are therefore excluded from the capture and always executed
+  (see *Interception*).
 
 ## What is in the terminal summary
 
@@ -383,12 +451,21 @@ capquery: sequences reset: 0, skipped (no table yet): 8
 capquery: captures 2 created, 1 updated, 0 unchanged, 0 deleted
 capquery: retried tests: tests/test_orders.py::test_create (2 attempts)
 capquery: unstable tests (captures removed): tests/test_orders.py::test_random
+capquery: tests/test_orders.py::test_round_trip was not captured: it holds values capquery cannot store
+capquery: tests/test_orders.py::test_round_trip: capquery cannot store values of type shop.money.Money
 ```
 
 The `statements:` line is the honest measure of a replay: `missed` and `executed
 against postgres` are zero when every data statement of every test was answered
 from the captures, and `always sent` counts the DDL and the transaction control of
 that session (it is never zero — the schema is really built).
+
+A test that is *not* replayed is always reported: `was not captured` names it and the
+line after it names the value or the statement that stopped the plugin. `retried`,
+`unstable` and `disabled` are reported the same way — there is no silent mode in which
+a test quietly stops being cached. `captures ... unchanged` counts the saves whose
+content already matched the file, so a replayed run reports `0 unchanged`: nothing was
+saved at all, which is what a replay means.
 
 ## Benchmark
 
@@ -432,6 +509,14 @@ aggregates or writes will.
 * an expected `IntegrityError` (or any other error from the database) cannot be
   replayed: only successful statements are captured, so on a replay run the
   statement succeeds instead of raising. Mark such tests with `capquery_ignore`;
+* a value no capture describes makes its test uncapturable: a project's own type that
+  arrives with a dumper of its own, or a postgres type the driver loads into something
+  the plugin has no representation for (a multirange, for instance). The test is
+  reported (`was not captured: ...`) and always runs against the database — as does the
+  migration phase of that session. Tell the plugin about such a type, or mark the test
+  with `capquery_ignore`;
+* a test that reads `django_migrations.applied` gets the fixed clock of the capture, not
+  the moment the migration really was applied;
 * tests with `transaction=True` are captured like any other, but they truncate
   tables between tests; if that turns out to make captures unstable, mark them
   with `capquery_ignore`;

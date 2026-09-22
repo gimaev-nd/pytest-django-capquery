@@ -75,3 +75,24 @@ def test_leading_keyword_skips_comments_and_parentheses():
     assert leading_keyword("-- x\n  ( SELECT 1") == "select"
     assert leading_keyword("\n\n") == ""
     assert leading_keyword(1234) == ""
+
+
+def test_the_driver_resolving_type_oids_is_never_cached():
+    """psycopg asks for the oid of hstore/citext once per process.
+
+    Whether that statement is issued depends on the *process* (a session that already
+    resolved the type does not ask again), so caching it would make the capture of a
+    migration phase depend on who recorded it and the phase would be redone for real on
+    every run.
+    """
+    assert classify("SELECT oid, typarray FROM pg_type WHERE typname = %s") == SYSTEM
+    assert (
+        classify(
+            "SELECT t.typname AS name, t.oid AS oid, t.typarray AS array_oid,"
+            " t.oid::regtype::text AS regtype FROM pg_type t WHERE t.oid = %s"
+        )
+        == SYSTEM
+    )
+    # a read of the catalogue the project itself wrote is still a data statement
+    assert classify("SELECT typname FROM pg_type") == DATA
+    assert classify("SELECT oid FROM pg_class WHERE relname = %s") == DATA

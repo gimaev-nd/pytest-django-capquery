@@ -34,7 +34,11 @@ holds::
 A schema is only as exact as the data allows.  A type no piece of data can be told
 apart from a string — ``decimal``, ``date``, ``time``, ``datetime``, ``timedelta``,
 ``uuid``, ``bytes`` — comes from the schema alone, so every value of a field that is
-described keeps the very type the recording run compared.
+described keeps the very type the recording run compared.  A range is described by its
+two bounds (postgres bounds are ``date``/``datetime``/``int``/``decimal``, and a range
+whose bounds are unset is a ``null`` descriptor there)::
+
+    {range: {lower: date, upper: date}}
 
 An ``executemany`` is one capture whose parameters are the parameter sets it was called
 with, so the schema of such a field describes the sets one by one::
@@ -66,7 +70,11 @@ __all__ = [
 #: Descriptor of a value that is ``None`` wherever the field holds anything at all.
 NULL_TYPE = "null"
 
-_CONTAINER_KINDS = ("list", "tuple", "dict")
+_CONTAINER_KINDS = ("list", "tuple", "dict", "range")
+
+#: Keys of a range payload that are plain data of the range itself; ``lower``/``upper``
+#: hold encoded values and are described by the schema.
+RANGE_META = ("bounds", "empty")
 
 
 class SchemaTable:
@@ -102,6 +110,9 @@ def descriptor_of(encoded: Any) -> Any:
     data = encoded.get("v")
     if kind == "dict":
         return {"dict": {str(key): descriptor_of(item) for key, item in (data or {}).items()}}
+    if kind == "range":
+        data = data or {}
+        return {"range": {name: descriptor_of(data.get(name)) for name in ("lower", "upper")}}
     if kind in ("list", "tuple"):
         return {kind: [descriptor_of(item) for item in (data or [])]}
     return kind
@@ -115,6 +126,11 @@ def plain_of(encoded: Any) -> Any:
     data = encoded.get("v")
     if kind == "dict":
         return {str(key): plain_of(item) for key, item in (data or {}).items()}
+    if kind == "range":
+        data = data or {}
+        plain = {name: plain_of(data.get(name)) for name in ("lower", "upper")}
+        plain.update({name: data.get(name) for name in RANGE_META})
+        return plain
     if kind in ("list", "tuple"):
         return [plain_of(item) for item in (data or [])]
     return data
@@ -201,6 +217,18 @@ def typed_of(descriptor: Any, plain: Any) -> Any:
             return {
                 "t": "dict",
                 "v": {str(key): _entry_of(contents, key, item) for key, item in plain.items()},
+            }
+        if kind == "range":
+            if not isinstance(plain, dict):
+                raise ValueError(f"the schema says a range where the data holds {plain!r}")
+            return {
+                "t": "range",
+                "v": {
+                    "lower": typed_of(contents.get("lower"), plain.get("lower")),
+                    "upper": typed_of(contents.get("upper"), plain.get("upper")),
+                    "bounds": plain.get("bounds", "[)"),
+                    "empty": bool(plain.get("empty")),
+                },
             }
         if not isinstance(plain, list):
             raise ValueError(f"the schema says a {kind} where the data holds {plain!r}")
