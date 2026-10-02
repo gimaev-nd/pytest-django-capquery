@@ -79,9 +79,10 @@ Three groups are never captured; they are executed against postgres every run:
 
 Django's own migration bookkeeping (`django_migrations`) belongs to the second
 group even though it is an ordinary `INSERT`: it records *when* a migration was
-applied, so its parameter changes on every run and could never be replayed. Its
-`SELECT`s are still replayed like any other read, with a fixed clock in their
-`applied` column — see *The migration phase*.
+applied, so a capture of it would hold the time of the run that recorded it and the
+file would differ on every recording run. Its `SELECT`s are still replayed like any
+other read, with a fixed clock in their `applied` column — see *The migration
+phase*.
 
 Because writes are replayed, the database does **not** contain what the captures
 say while a replayed test runs. That is the point (no round trip, no transaction
@@ -96,7 +97,7 @@ real migration phase instead — see *Behaviour rules* and the terminal summary.
 | --- | --- |
 | no capture file yet | capture: every data statement goes to postgres, the result is written |
 | capture file exists | replay: every data statement is answered from the file |
-| a statement of the test was not found in the file (a *miss*) | the statement goes to postgres, the test is retried in capture mode |
+| a statement of the test was not found in the file, or the position holds another query (a *miss*) | the statement goes to postgres, the test is retried in capture mode |
 | the test failed while using the captures | the test is retried in capture mode |
 | test marked `capquery_ignore`, or marked unstable | passthrough: no capture, no replay |
 
@@ -194,8 +195,8 @@ A test module that lives in the rootdir keeps its captures in
 
 ```yaml
 captures:
-  - hash: 4f0b7c1c...   # sha256 of (sql, params)
-    n: 0                # sequence number of this execution of the same (sql, params)
+  - n: 1                 # position of the statement in its test: the lookup key
+    hash: 4f0b7c1c...    # sha256 of the statement text: the check of that position
     sql: SELECT "shop_order"."id", "shop_order"."name" FROM "shop_order" WHERE "shop_order"."id" = %s
     schemas: {params: 1, rows: 2}
     params: [1]
@@ -212,8 +213,8 @@ Writes look exactly the same, with their `RETURNING` rows:
 
 ```yaml
 captures:
-  - hash: 90864b49...
-    n: 0
+  - n: 1
+    hash: 90864b49...
     sql: INSERT INTO "shop_order" ("name", "amount") VALUES (%s, %s) RETURNING "shop_order"."id"
     schemas: {params: 1, rows: 2}
     params: [fresh, '1.00']
@@ -278,8 +279,8 @@ with, so the schema of such a field describes the sets one by one:
 
 ```yaml
 captures:
-  - hash: 8bc794b8...
-    n: 0
+  - n: 1
+    hash: 8bc794b8...
     sql: INSERT INTO shop_order (name, amount) VALUES (%s, %s)
     schemas: {params: 1}
     params:
@@ -311,23 +312,50 @@ capquery: tests/test_orders.py::test_round_trip was not captured: it holds value
 capture that cannot be *written* is treated the same way, so a value the plugin cannot
 store never ends the session: the previous captures of that test are kept.
 
-The hash is computed as
+### How a statement is found
+
+A capture is found by the **position of the statement in its context** — the first
+data statement of the test, the second one, and so on — and the **hash of the
+statement text** is what the plugin checks once it has the record of that position:
 
 ```text
-sha256(sql + b"\x00" + stable_json(params))
+key    = (context, n)     # the test (or the migration phase) and the position
+check  = sha256(sql) == record.hash
 ```
 
-The idea of hashing the `(sql, params)` pair comes from
-[django-cacheops](https://github.com/Suor/django-cacheops)
-(`cacheops/query.py:_cache_key` hashes md5 of the SQL with the parameters
-applied); no code is copied and cacheops is not a dependency.
+The parameters take no part in either of them, which is deliberate:
 
-### Repeated executions of the same query
+* a value that is new in every run — `timezone.now`, a `uuid4` default, an `IN (...)`
+  list built from a `set` — does not make its statement unfindable: it is the same
+  query at the same position, and the rows of the capture are the answer of the
+  recording run. Such a test replays like any other instead of being regenerated
+  until it is marked unstable;
+* a statement a test executes several times (a `SELECT` before and after an `INSERT`)
+  is simply the first and the second data statement of the context, so its results
+  stay in execution order without a counter per query;
+* the check is positional, so an edited test cannot be answered with the rows of the
+  query it replaced: the statement that arrives at position `n` is compared with the
+  query the capture holds there. A statement that falls on a position captured for
+  another query is a **miss** exactly like a statement that was never recorded — it
+  goes to postgres, the test is retried and its capture is regenerated (rule 2) — and
+  the summary says how often it happened:
 
-If a test executes the same `(sql, params)` several times and gets different rows
-(for instance a `SELECT` before and after an `INSERT`), the results are stored as
-a list in execution order and the N-th execution is answered with the N-th stored
-result.
+```text
+capquery: 3 statement(s) did not match the query captured at their position (the test changed): tests/test_orders.py::test_orders_count (3)
+```
+
+The price of a positional key is that the statements of a test have to keep their
+order: an edit that shifts a position regenerates the whole capture of that test
+rather than a single record of it. `params` is stored with every capture for the
+reader of the file — it is not part of the key and it is not verified — so a capture
+written by an older version of the plugin (its hashes covered the parameters) never
+matches and its test regenerates the file.
+
+The lookup used to be the hash of the `(sql, params)` pair, an idea taken from
+[django-cacheops](https://github.com/Suor/django-cacheops) — its
+`cacheops/query.py:_cache_key` hashes md5 of the SQL with the parameters applied. It
+was given up because a parameter that is new in every run made the statement
+unfindable in every run. No code is copied and cacheops is not a dependency.
 
 ### In-memory sqlite
 
@@ -338,13 +366,14 @@ statement:
 
 ```sql
 CREATE TABLE captures (
-    ctx TEXT, hash TEXT, n INTEGER, sql TEXT, params TEXT, rowcount INTEGER,
+    ctx TEXT, n INTEGER, hash TEXT, sql TEXT, params TEXT, rowcount INTEGER,
     columns TEXT, rows BLOB,
-    PRIMARY KEY (ctx, hash, n)
+    PRIMARY KEY (ctx, n)
 )
 ```
 
-The SQL text is kept for diagnostics only — lookups are by hash.
+A lookup is by the position of the statement; the hash and the SQL text are kept to
+check the record that a position answers with, and for diagnostics.
 
 ## Migrations
 
@@ -399,7 +428,9 @@ column of datetimes is normalized; nothing else is touched.
 The post migrate signal (Django's content types and permissions) is never captured
 and always executed for real: it builds its `IN (...)` parameter lists from a
 `set`, so the same statement carries differently ordered parameters in every
-process and could never be replayed.
+process, and — since a capture is looked up by the position of a statement — a
+statement that appears in one process and not in another would shift the position of
+everything after it.
 
 If a replay of the migration phase misses a query, the phase cannot be trusted
 (the database state may differ from the state the cache was recorded in), so the
@@ -433,6 +464,16 @@ migrations are simply executed for real.
   migrations the tables do not exist yet on a fresh database. The plugin runs the
   command at the very start of the phase: on a reused database it does something
   useful, on a fresh one it is a no-op.
+* **A retried test that is the last one of its session.** pytest tears the session
+  fixtures down after a failed attempt, so the retry sets pytest-django's database
+  fixture up again — `setup_databases` runs a second time in the same process.
+  Django's `create_test_db` prefixes whatever name it finds in the settings, and
+  after the first setup that name is already `test_<database>`, so the second setup
+  would create `test_test_<database>`: another database, which the session knows
+  nothing about and into which the phase is replayed — that is, one that holds none
+  of the rows the migrations write. The plugin puts the name from the settings back
+  before every setup, exactly as Django's teardown does before it drops the
+  database.
 * **The reset and the introspection queries of the command itself are not
   captured** (the interceptor is suspended while they run), otherwise a replayed
   `sqlsequencereset` would be answered from the cache and would not reset
@@ -465,7 +506,10 @@ capquery: tests/test_orders.py::test_round_trip: capquery cannot store values of
 The `statements:` line is the honest measure of a replay: `missed` and `executed
 against postgres` are zero when every data statement of every test was answered
 from the captures, and `always sent` counts the DDL and the transaction control of
-that session (it is never zero — the schema is really built).
+that session (it is never zero — the schema is really built). A session in which a
+test changed prints one more line, naming the tests whose statement fell on a
+position captured for another query: that count is what tells an *edited* test apart
+from a test that merely gained a query (both are misses).
 
 A test that is *not* replayed is always reported: `was not captured` names it and the
 line after it names the value or the statement that stopped the plugin. `retried`,
@@ -501,10 +545,13 @@ aggregates or writes will.
   were skipped. The plugin handles that by asking for a real migration phase (see
   above) rather than by recording the result, but a suite that mixes replayed and
   non-replayed tests pays for a real phase;
-* a test that writes a value which differs on every run (`auto_now_add`, a `uuid4`
-  default, `timezone.now`) never matches its capture: the statement counts as a
-  miss, so the test is regenerated a few times and then marked unstable. Recording
-  such a test is pointless by nature — the values it sends are new every time;
+* a parameter is not part of the key, so the plugin cannot tell from the lookup
+  whether a test changed *what it asks for*: a statement that carries another id or
+  another filter value is still the same query at the same position and is answered
+  from its capture. A test whose parameters changed but whose statement did not has to
+  fail for the plugin to regenerate it (rule 3) — only an edited *statement* is noticed
+  by the check of its position (rule 2). `params` in a capture file is the parameter of
+  the recording run; it is not verified against the parameters of the replay;
 * a statement is never replayed if it is not a data statement or if it holds more
   than one statement (a `;` in the middle); such statements are simply executed;
 * a replayed `SELECT` is fully materialised in memory (Django does not use

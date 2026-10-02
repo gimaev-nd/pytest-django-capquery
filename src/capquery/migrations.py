@@ -26,7 +26,10 @@ Two things happen here that cannot be expressed with pytest-django's fixtures:
 The post migrate signal (Django's content types and permissions) is explicitly left
 out of the captures and always executed for real: it builds its ``IN (...)``
 parameter lists from a ``set``, so the very same statement carries differently
-ordered parameters in every process — nothing that could ever be replayed.
+ordered parameters in every process, and a capture recorded by one process would
+differ from the one the next process writes.  Since a capture is looked up by the
+position of a statement, a statement that appears in one process and not in another
+would also shift the positions of everything after it.
 
 Replaying is only possible when the database is created from scratch: with
 ``--reuse-db`` the state at replay time does not match the state that was
@@ -124,6 +127,7 @@ class MigrationsPhase:
         aliases = list(kwargs.get("aliases") or self._default_aliases())
         if not aliases:
             return self._original_setup_databases(*args, **kwargs)
+        self.restore_database_names(aliases)
         keepdb = bool(kwargs.get("keepdb", False))
         mode = self.mode_for(aliases[0], keepdb)
         ctx = CaptureContext(
@@ -196,6 +200,39 @@ class MigrationsPhase:
         if not self.plugin.migrations_path.exists():
             return RECORD
         return REPLAY
+
+    def restore_database_names(self, aliases: list[str]) -> None:
+        """Put the name from the settings back before a repeated database setup.
+
+        ``setup_databases`` runs more than once in one process when a retried test is
+        also the last test of its session: pytest tears the session fixtures down after
+        the first attempt, so the next attempt sets pytest-django's database fixture up
+        again.  Django's ``create_test_db`` prefixes whatever name it finds in the
+        settings, so that second run would create ``test_test_<name>`` — another
+        database, which the session knows nothing about and into which the migration
+        phase is replayed, so that it holds none of the rows the migrations write.
+        Django's teardown restores the name before it drops the database; the same has
+        to happen before setting it up again.
+        """
+        from django.db import connections
+
+        for alias in aliases:
+            connection = connections[alias]
+            original = self.plugin.original_database_names.get(alias)
+            if not original:
+                continue
+            if connection.settings_dict["NAME"] != self.test_name(connection, original):
+                continue
+            connection.close()
+            connection.settings_dict["NAME"] = original
+
+    @staticmethod
+    def test_name(connection, original: str) -> str:
+        """The name Django's test machinery gives to the database ``original``."""
+        from django.db.backends.base.creation import TEST_DATABASE_PREFIX
+
+        test_settings = connection.settings_dict.get("TEST") or {}
+        return str(test_settings.get("NAME") or TEST_DATABASE_PREFIX + original)
 
     def is_fresh_database(self, alias: str, keepdb: bool) -> bool:
         """True when this run creates the test database from scratch."""

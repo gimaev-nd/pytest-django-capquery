@@ -208,6 +208,10 @@ def check_replay(output: str, failures: list[str], number: int) -> None:
     """Every statement of runs 2..n is answered from the captures, phase included."""
     if "0 missed, 0 executed against postgres" not in output:
         failures.append(f"run {number}: a statement still went to postgres")
+    if "did not match the query captured at their position" in output:
+        failures.append(
+            f"run {number}: a statement fell on a position captured for another query"
+        )
     if "captures 0 created, 0 updated" not in output:
         failures.append(f"run {number}: a capture file was written")
     phase = output.split("migrations:", 1)[-1].splitlines()[0] if "migrations:" in output else ""

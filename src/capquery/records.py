@@ -14,10 +14,17 @@ __all__ = ["Record"]
 class Record:
     """One execution of one statement inside one capture context.
 
-    ``n`` is the sequence number of this execution among the executions of the
-    very same ``(sql, params)`` pair in the context.  It is what makes an
-    ordered replay possible when a statement returns different rows over the
-    lifetime of a test (for example a SELECT repeated after an INSERT).
+    ``n`` is the ordinal of the statement among the captured statements of the
+    context: 1 for the first one, 2 for the second, and so on.  It is the key a
+    replay looks up, and it is what makes an ordered replay possible when a
+    statement returns different rows over the lifetime of a test (a SELECT
+    repeated after an INSERT is simply the N-th statement of the context).
+
+    ``hash`` is the hash of the statement text
+    (:func:`capquery.hashing.query_hash`), never of its parameters.  The record
+    found at a position is served only when this hash is the hash of the statement
+    that arrived: another query at a captured position is a miss, so an edited test
+    can never be answered silently with the rows of the query it replaced.
 
     ``rowcount`` is what ``cursor.rowcount`` reported: the number of rows of a
     SELECT, and the number of affected rows of an INSERT/UPDATE/DELETE, which is
@@ -56,7 +63,11 @@ def record_from_db(
     rows: Any,
     rowcount: Optional[int] = None,
 ) -> Optional[Record]:
-    """Build a record from raw database results, or None if they are untypable."""
+    """Build a record of the ``n``-th captured statement from raw database results.
+
+    Returns None when the rows hold a value capquery cannot store, which leaves the
+    statement uncaptured (the caller reports it and keeps no capture for the test).
+    """
     from .values import UnsupportedValue, encode_row
 
     try:

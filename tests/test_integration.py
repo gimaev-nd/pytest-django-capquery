@@ -27,15 +27,19 @@ VARIANT_CAPTURE = "tests/captures/test_variant.py/test_variant.yaml"
 NO_IGNORED = ("-k", "not ignored")
 
 VARIANT_TEST = '''
-import decimal
 import os
 
 from demo.shop.models import Order
 
+#: a test whose *statement* is another one in every run — the ORDER BY changes with the
+#: variant, so no capture can ever describe it: a changing parameter would be answered
+#: from the capture (the parameters take no part in the key), a changing statement cannot
+ORDER_BY = {"10": "id", "20": "name", "30": "amount", "25": "created"}
+
 
 def test_variant(db):
-    threshold = decimal.Decimal(os.environ.get("CAPQUERY_VARIANT", "10"))
-    assert Order.objects.filter(amount__gte=threshold).count() >= 1
+    field = ORDER_BY[os.environ.get("CAPQUERY_VARIANT", "10")]
+    assert Order.objects.order_by(field).values_list("id", flat=True).first() is not None
 '''
 
 #: one more query for an existing test: its captures no longer answer it
@@ -55,6 +59,24 @@ def patch_orders_count(demo: Path) -> None:
     test_file = Path(demo) / "tests" / "test_orders.py"
     test_file.write_text(
         test_file.read_text(encoding="utf-8").replace(CHANGED_QUERY_FROM, CHANGED_QUERY_TO),
+        encoding="utf-8",
+    )
+
+
+#: one query *inserted* in front of the queries a test already had: every position of
+#: the test moves, and the first statement of it now falls on a captured position
+INSERT_QUERY_FROM = 'def test_orders_count(db):\n    assert Order.objects.count() == 3\n'
+INSERT_QUERY_TO = (
+    'def test_orders_count(db):\n'
+    '    assert Order.objects.filter(name="first").count() == 1\n'
+    '    assert Order.objects.count() == 3\n'
+)
+
+
+def insert_query_into_orders_count(demo: Path) -> None:
+    test_file = Path(demo) / "tests" / "test_orders.py"
+    test_file.write_text(
+        test_file.read_text(encoding="utf-8").replace(INSERT_QUERY_FROM, INSERT_QUERY_TO),
         encoding="utf-8",
     )
 
@@ -190,6 +212,76 @@ def test_a_changed_query_regenerates_the_captures(pytester, demo, demo_env):
     assert database  # the fixture configured a database
 
 
+def test_a_query_inserted_in_the_middle_is_noticed_as_a_changed_position(pytester, demo, demo_env):
+    """The check of a capture is positional: another query at a captured position.
+
+    The statement that arrives at position 1 is not the one the capture holds there, and
+    every position after it moves as well.  The plugin has to say so and regenerate,
+    rather than answer with the rows of the query it replaced.
+    """
+    demo_env("capquery_position")
+    assert run_demo(pytester, "--reuse-db", *NO_IGNORED).ret == 0
+    path = Path(demo) / ORDERS_COUNT
+    before = path.read_text(encoding="utf-8")
+    insert_query_into_orders_count(demo)
+
+    second = run_demo(pytester, "--reuse-db", *NO_IGNORED)
+    assert second.ret == 0, second.stdout
+    summary = summarize(second)
+    assert summary.changed, str(summary)
+    assert any("test_orders_count" in changed for changed in summary.changed), str(summary)
+    assert summary.missed > 0, str(summary)
+    assert summary.retried, str(summary)
+    assert summary.updated >= 1, str(summary)
+    assert path.read_text(encoding="utf-8") != before
+
+    third = run_demo(pytester, "--reuse-db", *NO_IGNORED)
+    assert third.ret == 0, third.stdout
+    summary = summarize(third)
+    assert summary.missed == 0, str(summary)
+    assert summary.changed == [], str(summary)
+    assert summary.retried == []
+
+
+VOLATILE_PARAMETER_TEST = '''
+import uuid
+
+from demo.shop.models import Order
+
+
+def test_a_parameter_that_is_new_in_every_run(db):
+    """The parameter differs in every process: the capture is found by its position.
+
+    A statement used to be looked up by the hash of its statement *and* its parameters,
+    so a value like this one was a miss in every run and the test was regenerated until
+    it was marked unstable.
+    """
+    assert Order.objects.filter(name=uuid.uuid4().hex).count() == 0
+'''
+
+VOLATILE_CAPTURE = (
+    "tests/captures/test_volatile.py/test_a_parameter_that_is_new_in_every_run.yaml"
+)
+
+
+def test_a_parameter_that_changes_between_runs_still_replays(pytester, demo, demo_env):
+    demo_env("capquery_volatile")
+    (Path(demo) / "tests" / "test_volatile.py").write_text(VOLATILE_PARAMETER_TEST, encoding="utf-8")
+    args = ("tests/test_volatile.py", "--capquery-min-tests=0", "--reuse-db")
+
+    first = run_demo(pytester, *args)
+    assert first.ret == 0, first.stdout
+    assert (Path(demo) / VOLATILE_CAPTURE).exists(), first.stdout
+
+    second = run_demo(pytester, *args)
+    assert second.ret == 0, second.stdout
+    summary = summarize(second)
+    assert summary.missed == 0, str(summary)
+    assert summary.executed_postgres == 0, str(summary)
+    assert summary.updated == 0, str(summary)
+    assert summary.changed == [], str(summary)
+
+
 def test_a_regeneration_redoes_the_phase_when_it_came_from_the_captures(pytester, demo, demo_env):
     """A changed query in a fully replayed session: the phase is redone for real first."""
     demo_env("capquery_redo")
@@ -242,6 +334,13 @@ def test_a_broken_capture_fails_the_test_then_regenerates_it(pytester, demo, dem
 
 
 def test_a_test_that_never_settles_loses_its_captures(pytester, demo, demo_env, monkeypatch):
+    """A test whose statements the plugin can never settle is marked unstable.
+
+    The variant test asks a *different* query in every run, so the statement at its
+    position is never the recorded one and every session regenerates its capture.  A
+    test that only changes its *parameters* does not behave like that at all: that is
+    ``test_a_parameter_that_changes_between_runs_still_replays``.
+    """
     demo_env("capquery_unstable")
     (Path(demo) / "tests" / "test_variant.py").write_text(VARIANT_TEST, encoding="utf-8")
     args = (

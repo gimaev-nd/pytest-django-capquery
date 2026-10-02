@@ -56,6 +56,9 @@ PASSED_RE = re.compile(r"(\d+) passed")
 RETRIED_RE = re.compile(r"capquery: retried tests: (.*)")
 UNCAPTURED_RE = re.compile(r"was not captured: it holds values capquery cannot store")
 RUNS_RE = re.compile(r"sequences reset: (\d+), skipped \(no table yet\): (\d+)")
+CHANGED_RE = re.compile(
+    r"(\d+) statement\(s\) did not match the query captured at their position"
+)
 
 LOG_LINE_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+ [A-Z]+ \[\d+\] ")
 LOG_STATEMENT_RE = re.compile(r"(?:execute [^:]*|statement): (.*)$")
@@ -67,9 +70,14 @@ OK = "PASS"
 BAD = "FAIL"
 
 #: One query of one test, changed on purpose by the control step: the captures of that
-#: test have to be regenerated, and nothing else in the project may change.
+#: test have to be regenerated, and nothing else in the project may change.  The control
+#: changes the *statement* — another query at the position the capture holds one — which
+#: is what the plugin checks: the hash of the query text that arrived at a captured
+#: position (the parameters take no part in it, so changing one is not a mismatch).
 CONTROL_BEFORE = 'assert ids(Ticket.objects.filter(labels__contains=["bug"])) == [1, 2, 3, 5]'
-CONTROL_AFTER = 'assert ids(Ticket.objects.filter(labels__contains=["cache"])) == [5]'
+CONTROL_AFTER = (
+    'assert ids(Ticket.objects.filter(labels__contains=["bug"], status="open")) == [1]'
+)
 CONTROL_CAPTURE = "tests/captures/test_reads_postgres.py/test_array_contains_a_label.yaml"
 
 
@@ -87,6 +95,7 @@ class RunResult:
         self.retried = RETRIED_RE.search(output)
         self.uncaptured = UNCAPTURED_RE.findall(output)
         self.sequences = RUNS_RE.search(output)
+        self.changed = CHANGED_RE.search(output)
         self.hashes: dict[str, str] = {}
         self.log_statements: list[str] = []
 
@@ -322,7 +331,9 @@ def main() -> int:
 
     results: list[RunResult] = []
     for number in range(1, args.runs + 1):
-        # a different hash seed per run: parameters built from a set would reorder
+        # a different hash seed per run: a statement whose parameters are built from a
+        # set sends different parameters in every run, and a capture has to answer it
+        # all the same (a lookup is by the position of the statement, not by its params)
         env["PYTHONHASHSEED"] = str(number)
         env["CAPQUERY_VERIFY_EXPECT_TICKETS"] = "5" if number == 1 else "0"
         results.append(
@@ -359,6 +370,9 @@ def main() -> int:
               f"created={result.created}, updated={result.updated}")
         check(f"{prefix}: the migration phase was replayed", result.migrations_replayed > 0 and result.migrations_missed == 0,
               result.migrations.group(0) if result.migrations else "no migrations line")
+        check(f"{prefix}: no statement fell on a position captured for another query",
+              result.changed is None,
+              result.changed.group(0) if result.changed else "")
         check(f"{prefix}: the captures are byte-identical to run 1", result.hashes == first.hashes,
               _describe_diff(first.hashes, result.hashes))
         check(f"{prefix}: the server received no write of the application's tables", not result.log_app_writes,
@@ -380,6 +394,9 @@ def main() -> int:
             changed, settled = control["changed"], control["settled"]
             check("control: the changed query was noticed", changed.updated == 1,
                   f"updated={changed.updated}, retried={changed.retried.group(1) if changed.retried else 'nothing'}")
+            check("control: the plugin reported the position that holds another query",
+                  bool(changed.changed) and int(changed.changed.group(1)) >= 1,
+                  changed.changed.group(0) if changed.changed else "no 'did not match' line")
             check("control: the test was retried once",
                   bool(changed.retried) and "test_array_contains_a_label" in changed.retried.group(1),
                   changed.retried.group(1) if changed.retried else "no 'retried tests' line")
@@ -513,11 +530,12 @@ def run_control(
     """Change one query of one test and watch the captures be regenerated.
 
     Without this step the stability of the runs above could be an artefact of the
-    captures never being looked at: the plugin has to notice the change (the stored
-    answer is a miss), retry the test, store the new answer — and then be stable again.
-    The last part is the interesting one: regenerating *any* capture makes the plugin
-    record the migration phase for real, and that is where the phase capture stops
-    being stable (see the return value and ``verification/README.md``).
+    captures never being looked at: the plugin has to notice the change (the statement
+    that arrives at a position holds another query, so the stored answer is a miss),
+    retry the test, store the new answer — and then be stable again.  The last part is
+    the interesting one: regenerating *any* capture makes the plugin record the
+    migration phase for real, and that is where the phase capture stops being stable
+    (see the return value and ``verification/README.md``).
     """
     path = work / "tests" / "test_reads_postgres.py"
     text = path.read_text()

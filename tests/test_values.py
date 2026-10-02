@@ -9,7 +9,6 @@ import uuid
 
 import pytest
 
-from capquery.hashing import query_hash
 from capquery.values import (
     UnsupportedValue,
     decode_row,
@@ -156,11 +155,6 @@ def test_subclasses_are_stripped_inside_parameters_rows_and_containers():
     }
 
 
-def test_a_subclass_hashes_like_its_base_value():
-    """A statement recorded before the subclasses were stripped keeps its hash."""
-    assert query_hash("SELECT %s", [_Status.FIRST]) == query_hash("SELECT %s", ["first"])
-
-
 def test_row_round_trip():
     row = (1, "name", decimal.Decimal("2.50"), None, b"\x01")
     assert decode_row(encode_row(row)) == row
@@ -299,7 +293,7 @@ def test_a_range_keeps_its_type_in_a_capture_file(tmp_path):
     range_value = _psycopg_range(datetime.date(2024, 3, 1), datetime.date(2024, 3, 31))
     record = Record(
         hash="9f2c",
-        n=0,
+        n=1,
         sql="SELECT active FROM shop_ticket WHERE id = %s",
         params=[{"t": "int", "v": 1}],
         rowcount=1,

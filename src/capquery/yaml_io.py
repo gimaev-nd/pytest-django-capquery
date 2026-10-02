@@ -3,8 +3,8 @@
 The format is a mapping of two fields, one file per capture context::
 
     captures:
-      - hash: 9f2c...
-        n: 0
+      - n: 1
+        hash: 9f2c...
         sql: SELECT id, name FROM shop_order WHERE id = %s
         schemas: {params: 1, rows: 2}
         params: [1]
@@ -15,6 +15,11 @@ The format is a mapping of two fields, one file per capture context::
     schemas:
       1: [int]
       2: [int, str]
+
+``n`` is the position of the statement in its context — the file holds the statements
+in the order they were executed — and ``hash`` is the hash of the statement text: a
+replay finds the statement by its position and serves the record only when the hash
+matches, so an edited query is never answered with the rows it replaced.
 
 ``captures`` holds the queries with their results and ``schemas`` the types of the
 values: a capture names the schema of every field that holds typed values by id, and
@@ -111,8 +116,8 @@ def _capture(record: Record, schemas: SchemaTable) -> _BlockMap:
     if record.rows:
         ids["rows"] = schemas.id_for(schema_of_rows(record.rows))
     capture = _BlockMap()
-    capture["hash"] = record.hash
     capture["n"] = record.n
+    capture["hash"] = record.hash
     capture["sql"] = record.sql
     if ids:
         capture["schemas"] = ids
@@ -140,7 +145,7 @@ def read_capture(path: Path) -> list[Record]:
         raise CaptureFileError(f"capquery: {path} must hold the captures as a list")
     records = []
     for capture in captures:
-        if not isinstance(capture, dict) or "hash" not in capture or "sql" not in capture:
+        if not isinstance(capture, dict) or not {"n", "hash", "sql"} <= set(capture):
             raise CaptureFileError(f"capquery: {path} contains a malformed capture: {capture!r}")
         try:
             records.append(_read_capture(capture, schemas))

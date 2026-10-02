@@ -1,35 +1,38 @@
-"""Query hashing and statement classification."""
+"""Query hashing."""
 
 from __future__ import annotations
 
-from capquery.hashing import hash_for, query_hash, stable_json
+import hashlib
+
+from capquery.hashing import query_hash, stable_json
 
 
 def test_hash_is_deterministic():
     sql = "SELECT id FROM t WHERE id = %s"
-    assert query_hash(sql, (1,)) == query_hash(sql, (1,))
+    assert query_hash(sql) == query_hash(sql)
 
 
 def test_hash_depends_on_the_sql():
-    assert query_hash("SELECT 1", ()) != query_hash("SELECT 2", ())
+    assert query_hash("SELECT 1") != query_hash("SELECT 2")
 
 
-def test_hash_depends_on_the_parameters():
-    sql = "SELECT id FROM t WHERE id = %s"
-    assert query_hash(sql, (1,)) != query_hash(sql, (2,))
+def test_hash_is_the_hash_of_the_statement_text_alone():
+    """The parameters take no part in the lookup key, so they take none in the hash.
+
+    A capture is found by the position of its statement, and this hash only has to
+    answer whether the query at that position is still the recorded one: a statement
+    executed with a value that is new in every run is found again.
+    """
+    assert query_hash("SELECT id FROM t WHERE id = %s") == hashlib.sha256(
+        b"SELECT id FROM t WHERE id = %s"
+    ).hexdigest()
 
 
-def test_hash_does_not_depend_on_the_parameter_type():
-    assert query_hash("SELECT %s", (1,)) != query_hash("SELECT %s", ("1",))
-
-
-def test_hash_ignores_an_empty_parameter_list():
-    assert hash_for("SELECT 1", []) == hash_for("SELECT 1", [])
-
-
-def test_hash_is_not_affected_by_the_order_of_named_parameters():
-    sql = "SELECT :a, :b"
-    assert query_hash(sql, {"a": 1, "b": 2}) == query_hash(sql, {"b": 2, "a": 1})
+def test_two_executions_of_one_statement_share_the_hash():
+    sql = "SELECT id FROM t WHERE name = %s"
+    # the same statement: two positions of one context, one hash
+    assert query_hash(sql) == query_hash(sql)
+    assert query_hash(sql) != query_hash("SELECT id FROM t WHERE name = %s AND id > 0")
 
 
 def test_stable_json_sorts_keys():
@@ -41,4 +44,4 @@ def test_stable_json_is_compact():
 
 
 #: which statements may be captured at all is decided in ``statements.py``, see
-#: ``tests/test_statements.py``; hashing only turns them into a lookup key
+#: ``tests/test_statements.py``; hashing only turns a statement into its check value

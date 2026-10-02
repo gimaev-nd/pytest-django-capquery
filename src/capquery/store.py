@@ -17,40 +17,45 @@ __all__ = ["CaptureStore"]
 
 _SCHEMA = """
 CREATE TABLE captures (
-    ctx     TEXT    NOT NULL,
-    hash    TEXT    NOT NULL,
-    n       INTEGER NOT NULL,
+    ctx      TEXT    NOT NULL,
+    n        INTEGER NOT NULL,
+    hash     TEXT    NOT NULL,
     sql      TEXT    NOT NULL,
     params   TEXT    NOT NULL,
     rowcount INTEGER,
     columns  TEXT    NOT NULL,
     rows     BLOB    NOT NULL,
-    PRIMARY KEY (ctx, hash, n)
+    PRIMARY KEY (ctx, n)
 )
 """
 
 
 class CaptureStore:
-    """Lookup table ``(context, query hash, sequence number) -> record``."""
+    """Lookup table ``(context, ordinal of the statement) -> record``.
+
+    The hash of the statement is a column of the record, not part of the key: a
+    lookup answers with the record of that position and the caller decides whether
+    it is the query it asked about (:func:`capquery.hashing.query_hash`).
+    """
 
     def __init__(self) -> None:
         self._conn = sqlite3.connect(":memory:")
         self._conn.execute(_SCHEMA)
         # sqlite stays the single source of truth; this index only spares the
         # plugin a query plus a json decode for every replayed statement
-        self._index: dict[tuple[str, str, int], Record] = {}
+        self._index: dict[tuple[str, int], Record] = {}
 
     # -- loading ---------------------------------------------------------
     def add_record(self, ctx: str, record: Record) -> None:
-        self._index[(ctx, record.hash, record.n)] = record
+        self._index[(ctx, record.n)] = record
         self._conn.execute(
             "INSERT OR REPLACE INTO captures"
-            " (ctx, hash, n, sql, params, rowcount, columns, rows)"
+            " (ctx, n, hash, sql, params, rowcount, columns, rows)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 ctx,
-                record.hash,
                 record.n,
+                record.hash,
                 record.sql,
                 stable_json(record.params),
                 record.rowcount,
@@ -79,14 +84,15 @@ class CaptureStore:
         return row is not None
 
     # -- lookup ----------------------------------------------------------
-    def lookup(self, ctx: str, query_hash: str, n: int) -> Optional[Record]:
-        record = self._index.get((ctx, query_hash, n))
+    def lookup(self, ctx: str, n: int) -> Optional[Record]:
+        """The record captured for the ``n``-th statement of the context."""
+        record = self._index.get((ctx, n))
         if record is not None:
             return record
         row = self._conn.execute(
-            "SELECT hash, n, sql, params, rowcount, columns, rows"
-            " FROM captures WHERE ctx = ? AND hash = ? AND n = ?",
-            (ctx, query_hash, n),
+            "SELECT n, hash, sql, params, rowcount, columns, rows"
+            " FROM captures WHERE ctx = ? AND n = ?",
+            (ctx, n),
         ).fetchone()
         if row is None:
             return None
@@ -94,8 +100,8 @@ class CaptureStore:
 
     def records(self, ctx: str) -> list[Record]:
         rows = self._conn.execute(
-            "SELECT hash, n, sql, params, rowcount, columns, rows"
-            " FROM captures WHERE ctx = ? ORDER BY hash, n",
+            "SELECT n, hash, sql, params, rowcount, columns, rows"
+            " FROM captures WHERE ctx = ? ORDER BY n",
             (ctx,),
         ).fetchall()
         return [self._row_to_record(row) for row in rows]
@@ -113,8 +119,8 @@ class CaptureStore:
     @staticmethod
     def _row_to_record(row: Any) -> Record:
         return Record(
-            hash=row[0],
-            n=row[1],
+            hash=row[1],
+            n=row[0],
             sql=row[2],
             params=json.loads(row[3]),
             rowcount=None if row[4] is None else int(row[4]),

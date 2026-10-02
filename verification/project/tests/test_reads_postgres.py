@@ -41,6 +41,18 @@ def test_array_contains_a_label(db):
     assert ids(Ticket.objects.filter(labels__contains=["bug"])) == [1, 2, 3, 5]
 
 
+def test_a_parameter_that_is_new_in_every_run(db):
+    """A value no two runs share must not make its statement unfindable.
+
+    A capture is looked up by the position of the statement in its test, and the hash
+    of the query text is only compared with what the capture holds: the parameters take
+    no part in it.  A parameter like this one (a fresh uuid in every process) is
+    therefore answered from the capture like any other, and the suite has to replay it
+    without a single miss.
+    """
+    assert ids(Ticket.objects.filter(title=uuid.uuid4().hex)) == []
+
+
 def test_array_overlaps_a_list(db):
     assert ids(Ticket.objects.filter(labels__overlap=["ui", "perf"])) == [1, 2, 4]
 

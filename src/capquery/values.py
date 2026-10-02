@@ -3,10 +3,12 @@
 A value gets an exact type and value pair — ``{t: <type>, v: <value>}`` — because
 decoding has to give back objects of the very same type: a test compares exactly what
 it compared during the recording run (``Decimal`` stays ``Decimal``, a ``Range`` stays
-a ``Range`` and so on).  The pair is what the plugin keeps of a value: the query hash is
-computed from the encoded parameters and the in-memory sqlite store keeps them.  A
-capture file writes the data of a value and its type separately — the data in the
-field, the type in the schema of that field (:mod:`capquery.schemas`).
+a ``Range`` and so on).  The pair is what the plugin keeps of a value: the encoded
+parameters are stored next to the rows they were sent with — they take no part in the
+lookup key, a capture is found by the position of its statement — and the in-memory
+sqlite store keeps them.  A capture file writes the data of a value and its type
+separately — the data in the field, the type in the schema of that field
+(:mod:`capquery.schemas`).
 
 Values are stored as the *exact* builtin type: a subclass of ``str``/``int``/``float``
 — Django's ``models.TextChoices`` and ``models.IntegerChoices``, ``enum.StrEnum``, a
@@ -358,10 +360,10 @@ def decode_row(row: Any) -> tuple:
 
 
 def encode_params(params: Any) -> list:
-    """Encode query parameters into a hashable, storable form.
+    """Encode query parameters into a storable form.
 
-    ``None`` and ``()`` mean "no parameters" and are encoded identically, so a
-    query with and without an empty parameter list hashes to the same value.
+    ``None`` and ``()`` mean "no parameters" and are encoded identically, so the stored
+    parameters of a statement do not depend on how the caller spelled "no parameters".
     """
     if params is None:
         return []

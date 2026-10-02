@@ -160,6 +160,8 @@ class CapQueryPlugin:
         self.managed: dict[str, pytest.Item] = {}
         self.unstable: list[str] = []
         self.retried: dict[str, int] = {}
+        #: node id -> statements that fell on a position captured for another query
+        self.changed: dict[str, int] = {}
         self.unsupported: list[str] = []
         self.deferred: list[str] = []
         #: True when a test of this session will run against the database instead of
@@ -297,6 +299,13 @@ class CapQueryPlugin:
                 f"{self.counters['system_statements']} always sent "
                 f"(schema, transaction control)"
             )
+            if self.changed:
+                total = sum(self.changed.values())
+                write(
+                    f"capquery: {total} statement(s) did not match the query captured at their "
+                    f"position (the test changed): "
+                    + ", ".join(f"{nodeid} ({count})" for nodeid, count in self.changed.items())
+                )
             migrations = self.migrations.describe()
             if migrations:
                 write(f"capquery: {migrations}")
@@ -382,6 +391,10 @@ class CapQueryPlugin:
             with interceptor.activate(ctx):
                 reports = runtestprotocol(item, log=False, nextitem=nextitem)
             self._aggregate(ctx)
+            if ctx.changed:
+                # the plugin found another query where the capture holds one: the test
+                # was edited, and the position of every statement after it moved
+                self.changed[nodeid] = self.changed.get(nodeid, 0) + ctx.changed
             decision = self._decide(ctx, reports)
             if decision == "regenerate":
                 if not self._make_phase_real():

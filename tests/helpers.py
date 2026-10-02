@@ -32,6 +32,8 @@ class Summary:
         self.disabled: str | None = None
         self.unstable: list[str] = []
         self.retried: list[str] = []
+        #: tests with statements that fell on a position captured for another query
+        self.changed: list[str] = []
         self.deferred: list[str] = []
         self.enabled_line = next((line for line in self.lines if not line.startswith("capquery: disabled")), "")
         joined = "\n".join(self.lines)
@@ -59,6 +61,8 @@ class Summary:
                 self.unstable = [item.strip() for item in line.split(":", 2)[2].split(",")]
             elif line.startswith("capquery: retried tests"):
                 self.retried = [item.strip() for item in line.split(":", 2)[2].split(",")]
+            elif "did not match the query captured at their position" in line:
+                self.changed = [item.strip() for item in line.split(":", 2)[2].split(",")]
             elif line.startswith("capquery: tests that need the real migration phase"):
                 self.deferred = [
                     item.strip() for item in line.split(":", 2)[2].split(",") if item.strip()

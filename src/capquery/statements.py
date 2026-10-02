@@ -19,9 +19,11 @@ they never consume a capture entry:
   cannot silently lose its side effect.
 
 Django's own migration bookkeeping (``django_migrations``) is in the second group
-even though it is an ordinary ``INSERT``: it records when a migration was applied
-*now*, so its parameter changes on every run and it could never be replayed.  It
-is written for real, its ``SELECT``s are still replayed like any other read.
+even though it is an ordinary ``INSERT``: its parameters hold the moment the
+migration was applied *now*, so a capture of it would carry the time of the run it
+was recorded in and the file would differ on every recording run.  It is written for
+real, its ``SELECT``s are still replayed like any other read, with a fixed clock in
+their ``applied`` column (:mod:`capquery.migration_time`).
 """
 
 from __future__ import annotations
@@ -52,11 +54,11 @@ _LEADING_RE = re.compile(
 
 #: A read the *driver* issues to resolve postgres type oids (``psycopg`` asks for the
 #: oids of hstore/citext/… once per process).  Whether it appears does not depend on the
-#: project but on whether the process already resolved that type, so caching one would
-#: make the capture of a phase depend on the process that recorded it: the phase
-#: re-recorded inside a session (a regeneration) would not issue them, the next session
-#: started cold would, and the phase would be redone for real for ever.  They are
-#: metadata reads of a handful of catalogue rows, so they always go to postgres.
+#: project but on whether the process already resolved that type, and a capture is looked
+#: up by the position of a statement: a phase that issued these reads in one process and
+#: not in another would describe the following statements with different positions, and
+#: the phase would be redone for real for ever.  They are metadata reads of a handful of
+#: catalogue rows, so they always go to postgres.
 _DRIVER_TYPE_LOOKUP_RE = re.compile(r"(?=.*\bpg_type\b)(?=.*\btyparray\b)", re.IGNORECASE | re.DOTALL)
 
 #: The statement kinds whose result capquery stores and replays.
@@ -126,9 +128,9 @@ def system_tables() -> frozenset:
     """Tables capquery never captures writes of.
 
     ``django_migrations`` is postgres-side bookkeeping of the migration executor:
-    every applied migration adds a row with the current timestamp, so the very same
-    ``INSERT`` has different parameters on every run.  Recording it would only
-    guarantee a miss on the next replay, so it is executed for real instead.  Reads of
+    every applied migration adds a row with the current timestamp, so a capture of
+    that ``INSERT`` would hold the moment of the run that recorded it and the file
+    would change on every recording run.  It is executed for real instead.  Reads of
     those tables *are* captured, with a fixed clock in their ``applied`` column
     (:mod:`capquery.migration_time`).
     """

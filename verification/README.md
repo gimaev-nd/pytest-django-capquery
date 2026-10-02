@@ -41,15 +41,17 @@ the ordinary write paths and 15 tests that use the ORM the way a project does
 ## Result
 
 ```
-48 checks, 5 runs of 77 managed tests, 79 capture files                 PASS
-  run 1: 126 statements executed against postgres, 77 captures created
-  run 2..5: 126 statements replayed, 0 missed, 0 executed against postgres,
+53 checks, 5 runs of 78 managed tests, 80 capture files                 PASS
+  run 1: 127 statements executed against postgres, 78 captures created
+  run 2..5: 127 statements replayed, 0 missed, 0 executed against postgres,
             0 captures written, migration phase replayed (21 statements), exit code 0
+  no statement fell on a position captured for another query
   every capture file byte-identical to run 1 (state file included)
   postgres log of runs 2..5: no read and no write of the application's tables
   the raw psycopg connection sees 0 rows in shop_ticket while the tests see the seeds
-  control step: changing one query is noticed, the test is retried, exactly that one
-  file changes, and the captures settle again two runs later
+  control step: changing one query is noticed (the statement at a captured position is
+  another one), the test is retried, exactly that one file changes, and the captures
+  settle again two runs later
   probe session: 8 tests that hold a value capquery cannot store are reported, write no
   capture file, and the migration phase they force is byte-identical across two sessions
 ```
@@ -57,24 +59,29 @@ the ordinary write paths and 15 tests that use the ORM the way a project does
 `run_psycopg2.py` runs the same suite on the other driver Django 4.2/5.x supports:
 
 ```
-77 managed tests, 79 capture files, runs 1..4                          PASS
-  run 1: 77 captures created, 126 statements executed against postgres, nothing uncapturable
-  runs 2..4: 126 statements replayed, 0 missed, 0 executed against postgres, 0 captures
+78 managed tests, 80 capture files, runs 1..4                          PASS
+  run 1: 78 captures created, 127 statements executed against postgres, nothing uncapturable
+  runs 2..4: 127 statements replayed, 0 missed, 0 executed against postgres, 0 captures
              written, migration phase replayed (21 statements), exit code 0
   every capture file byte-identical to run 1
 ```
 
-The suite is run with a different `PYTHONHASHSEED` per run, so a statement whose
-parameters are ordered by a `set` would show up as a miss instead of a silent pass.
+The suite is run with a different `PYTHONHASHSEED` per run, so the parameters of a
+statement that builds its list from a `set` differ between runs (order included).  Under
+the positional key such a statement is answered from the capture like any other — the
+parameters are no part of the lookup — which is exactly the property the project's
+`test_a_parameter_that_is_new_in_every_run` (a fresh `uuid4` in every process) and the
+`missed == 0` of runs 2..5 pin down.
 
 ## How the checks avoid passing by accident
 
 * **Non-vacuous**: run 1 has to create exactly one capture file per managed test
-  (77/77), so "nothing changed" cannot mean "nothing was captured".
+  (78/78), so "nothing changed" cannot mean "nothing was captured".
 * **Control step**: the script changes one query of one test
-  (`labels__contains=["bug"]` → `["cache"]`), and the plugin has to *notice*: the
-  statement misses, the test is retried (`(2 attempts)`), the run passes, exactly that
-  one capture file changes, and two runs later every file is identical again.
+  (`labels__contains=["bug"]` → `labels__contains=["bug"], status="open"` — another
+  statement at the position the capture holds one), and the plugin has to *notice*:
+  the statement misses, the test is retried (`(2 attempts)`), the run passes, exactly
+  that one capture file changes, and two runs later every file is identical again.
 * **Independent evidence**: the postgres log and a raw psycopg connection, both outside
   Django and outside the plugin.
 * **A separate probe session**: tests that hold a value which cannot be stored at all
@@ -173,8 +180,8 @@ files, 8 tests uncapturable, `migrations: … 21 recorded`.
 and by recognizing the driver's own `inet` adapter (`capquery.values._ipaddress_text`:
 `Inet.addr` is the text the server receives, a netmask included).  A capture decoded where
 psycopg 3 is not installed is rebuilt as psycopg2's *generic* `Range`, which compares equal
-to its `DateRange`/`NumericRange` (`_range_class`).  `run_psycopg2.py` checks it: 77 of 77
-managed tests captured, then 126 statements replayed, 0 missed, 79 capture files
+to its `DateRange`/`NumericRange` (`_range_class`).  `run_psycopg2.py` checks it: 78 of 78
+managed tests captured, then 127 statements replayed, 0 missed, 80 capture files
 byte-identical.
 
 ### 4. What is still not cacheable
@@ -191,9 +198,14 @@ capquery: probe/test_uncapturable_values.py::test_a_parameter_of_an_unknown_type
 capquery: probe/test_uncapturable_values.py::test_a_result_of_an_unknown_type: result of "SELECT '{[1,3),[5,8)}'::int4multirange" holds a value capquery cannot store
 ```
 
-`tasks/2.draft.md` is about the related, bigger case: values that are *new on every run*
-(`auto_now_add`, `uuid4`, `DEFAULT now()`), which today cost a retry, a real migration
-phase and a rewritten capture file before the test is marked unstable.
+Values that are *new on every run* (`auto_now_add`, `uuid4`, `DEFAULT now()`, an
+`IN (...)` list built from a `set`) used to be the bigger case of the same kind: they
+cost a retry, a real migration phase and a rewritten capture file before the test was
+marked unstable.  They are not a problem any more: a capture is looked up by the
+position of the statement in its test, and the hash of the query text does not cover the
+parameters, so such a statement is answered from the capture like any other.
+`tests/test_reads_postgres.py::test_a_parameter_that_is_new_in_every_run` sends a fresh
+`uuid4` in every process and is replayed in runs 2..5 with `missed == 0`.
 
 ## Smaller observations
 

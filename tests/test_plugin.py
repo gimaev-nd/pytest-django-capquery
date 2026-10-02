@@ -53,7 +53,7 @@ def _records(params: list) -> list[Record]:
     return [
         Record(
             hash="9f2c",
-            n=0,
+            n=1,
             sql="SELECT id FROM shop_order WHERE name = %s",
             params=params,
             rowcount=1,
@@ -175,3 +175,47 @@ def test_an_unstorable_migration_capture_is_reported_instead_of_failing_the_setu
 
     assert not plugin.migrations_path.exists()
     assert any("migration phase was not captured" in message for message in plugin.warnings)
+
+
+class _TerminalReporter:
+    """The one method ``pytest_terminal_summary`` writes through."""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def write_line(self, text: str, **kwargs) -> None:
+        self.lines.append(text)
+
+
+def test_a_statement_that_landed_on_another_query_is_reported(tmp_path):
+    """The check of a capture is positional, and the plugin says so in the summary.
+
+    A statement that fell on a position captured for another query is a miss like any
+    other — but it is the interesting one: the test was edited, and the position of
+    every statement after it moved too.  The report names the test and the count.
+    """
+    plugin = _plugin(tmp_path)
+    plugin.enabled = True
+    plugin.reason = "16 database test(s) for 16 managed test(s)"
+    plugin.changed[_Item.nodeid] = 2
+    reporter = _TerminalReporter()
+
+    plugin.pytest_terminal_summary(reporter, 0, plugin.config)
+
+    line = next(
+        line for line in reporter.lines if "did not match the query captured at their position" in line
+    )
+    assert line.startswith("capquery: 2 statement(s)")
+    assert _Item.nodeid in line
+    assert "(2)" in line
+
+
+def test_a_session_without_a_changed_position_says_nothing_about_it(tmp_path):
+    plugin = _plugin(tmp_path)
+    plugin.enabled = True
+    plugin.reason = "16 database test(s) for 16 managed test(s)"
+    reporter = _TerminalReporter()
+
+    plugin.pytest_terminal_summary(reporter, 0, plugin.config)
+
+    assert not [line for line in reporter.lines if "did not match" in line]

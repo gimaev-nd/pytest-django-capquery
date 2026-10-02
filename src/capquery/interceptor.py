@@ -12,6 +12,14 @@ replayed ``INSERT`` answers from its record: its rows (``RETURNING``) and its ro
 count, which is what Django returns from ``QuerySet.update()`` and
 ``QuerySet.delete()``.  Schema DDL, transaction control and unrecognised
 statements are always executed against postgres (see ``statements.py``).
+
+A capture is looked up by the **ordinal of the statement** in its context (the first
+data statement of the test, the second one, …) and the **hash of the statement** says
+whether the recording still describes the query that arrived.  The parameters take no
+part in the key, so a statement is found again even when it carries a parameter that is
+new in every run; when a captured position holds another query, that statement goes to
+postgres and the test is regenerated, exactly like a statement that was not found at
+all (the summary counts those two cases separately).
 """
 
 from __future__ import annotations
@@ -23,7 +31,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 
 from . import migration_time
-from .hashing import hash_for
+from .hashing import query_hash
 from .records import Record, record_from_db
 from .statements import is_data_statement
 from .values import UnsupportedValue, encode_params
@@ -58,8 +66,12 @@ class CaptureContext:
     mode: str
     store: Any
     suspended: bool = False
+    #: ordinal of the last captured statement of this context: the lookup key
+    position: int = 0
     hits: int = 0
     misses: int = 0
+    #: statements that fell on a position captured for another query
+    changed: int = 0
     db_statements: int = 0
     system_statements: int = 0
     replayed_statements: int = 0
@@ -67,12 +79,18 @@ class CaptureContext:
     unsupported: Optional[str] = None
     last_sql: Optional[str] = None
     missed_sql: list = field(default_factory=list)
-    _next: dict = field(default_factory=dict)
+    changed_sql: list = field(default_factory=list)
 
-    def next_n(self, query_hash: str) -> int:
-        n = self._next.get(query_hash, 0)
-        self._next[query_hash] = n + 1
-        return n
+    def next_position(self) -> int:
+        """Take the next position of this context: 1 for its first statement."""
+        self.position += 1
+        return self.position
+
+    def note_changed(self, position: int, sql: str) -> None:
+        """A recorded position holds another query: the test is not the recorded one."""
+        self.changed += 1
+        if len(self.changed_sql) < 5:
+            self.changed_sql.append(f"position {position}: {' '.join(sql.split())[:150]}")
 
     def note_unsupported(self, message: str) -> None:
         if self.unsupported is None:
@@ -86,6 +104,7 @@ class CaptureContext:
     @property
     def capture_mode(self) -> bool:
         return self.mode in (RECORD, REPLAY)
+
 
 
 @contextlib.contextmanager
@@ -233,7 +252,7 @@ def _trace(*parts: Any) -> None:
         handle.write(" | ".join(str(part) for part in parts) + "\n")
 
 
-def _record_result(wrapper, ctx, *, sql, encoded_params, query_hash, n):
+def _record_result(wrapper, ctx, *, sql, encoded_params, query_hash, position):
     """Store what the database answered, so a later run can answer instead."""
     try:
         description = wrapper.cursor.description
@@ -248,12 +267,12 @@ def _record_result(wrapper, ctx, *, sql, encoded_params, query_hash, n):
     rows = migration_time.normalize_rows(sql, columns, rows)
     ctx.last_sql = sql
     _set_buffer(wrapper, rows, columns, rowcount)
-    _trace("REC", ctx.mode, ctx.key, f"{query_hash[:8]}#{n}", sql.replace("\n", " ")[:90])
+    _trace("REC", ctx.mode, ctx.key, _label(position, query_hash), sql.replace("\n", " ")[:90])
     record = record_from_db(
         sql=sql,
         encoded_params=encoded_params,
         query_hash=query_hash,
-        n=n,
+        n=position,
         columns=columns,
         rows=rows,
         rowcount=rowcount,
@@ -264,7 +283,7 @@ def _record_result(wrapper, ctx, *, sql, encoded_params, query_hash, n):
         ctx.recorded.append(record)
 
 
-def _serve_from_capture(wrapper, ctx, record, *, sql, query_hash, n, kind):
+def _serve_from_capture(wrapper, ctx, record, *, sql, query_hash, position, kind):
     """Answer an execute() from the captures without touching postgres."""
     _reset_buffer(wrapper)
     ctx.mark_replayed(sql)
@@ -274,15 +293,20 @@ def _serve_from_capture(wrapper, ctx, record, *, sql, query_hash, n, kind):
         list(record.columns),
         record.effective_rowcount(),
     )
-    _trace(kind, ctx.mode, ctx.key, f"{query_hash[:8]}#{n}", sql.replace("\n", " ")[:90])
+    _trace(kind, ctx.mode, ctx.key, _label(position, query_hash), sql.replace("\n", " ")[:90])
 
 
-def _note_miss(ctx, sql: str, query_hash: str, n: int, kind: str) -> None:
+def _label(position: int, query_hash: str) -> str:
+    """``#3 9f2c14ab``: the position of a statement, and (a prefix of) its hash."""
+    return f"#{position} {query_hash[:8]}"
+
+
+def _note_miss(ctx, sql: str, position: int, query_hash: str, kind: str) -> None:
     ctx.misses += 1
     ctx.db_statements += 1
     if len(ctx.missed_sql) < 5:
-        ctx.missed_sql.append(" ".join(sql.split())[:160])
-    _trace(kind, ctx.mode, ctx.key, f"{query_hash[:8]}#{n}", sql.replace("\n", " ")[:90])
+        ctx.missed_sql.append(f"position {position}: " + " ".join(sql.split())[:160])
+    _trace(kind, ctx.mode, ctx.key, _label(position, query_hash), sql.replace("\n", " ")[:90])
 
 
 def _execute(wrapper, sql, params=None):
@@ -291,29 +315,36 @@ def _execute(wrapper, sql, params=None):
         _reset_buffer(wrapper)
         return _original["execute"](wrapper, sql, params)
     if not is_data_statement(sql):
-        # schema DDL, transaction control, maintenance: always for real
+        # schema DDL, transaction control, maintenance: always for real, and they take
+        # no position of the context (a capture file holds data statements only)
         _reset_buffer(wrapper)
         ctx.system_statements += 1
         _trace("SYSTEM", ctx.mode, ctx.key, " ".join(sql.split())[:90])
         return _original["execute"](wrapper, sql, params)
+
+    statement_hash = query_hash(sql)
+    position = ctx.next_position()
+    if ctx.mode == REPLAY:
+        record = ctx.store.lookup(ctx.key, position)
+        if record is not None and record.hash == statement_hash:
+            _serve_from_capture(
+                wrapper, ctx, record, sql=sql, query_hash=statement_hash, position=position, kind="REPLAY"
+            )
+            return None
+        if record is not None:
+            # the position is taken by another query: the test is not the recorded one
+            ctx.note_changed(position, sql)
+        _note_miss(ctx, sql, position, statement_hash, "CHANGED" if record is not None else "MISS")
+        _reset_buffer(wrapper)
+        return _original["execute"](wrapper, sql, params)
+
     try:
         encoded_params = encode_params(params)
-        query_hash = hash_for(sql, encoded_params)
     except UnsupportedValue as exc:
         ctx.note_unsupported(str(exc))
         _reset_buffer(wrapper)
         ctx.db_statements += 1
         _trace("UNSUPPORTED", ctx.mode, ctx.key, " ".join(sql.split())[:90], str(exc)[:90])
-        return _original["execute"](wrapper, sql, params)
-
-    n = ctx.next_n(query_hash)
-    if ctx.mode == REPLAY:
-        record = ctx.store.lookup(ctx.key, query_hash, n)
-        if record is not None:
-            _serve_from_capture(wrapper, ctx, record, sql=sql, query_hash=query_hash, n=n, kind="REPLAY")
-            return None
-        _note_miss(ctx, sql, query_hash, n, "MISS")
-        _reset_buffer(wrapper)
         return _original["execute"](wrapper, sql, params)
 
     result = _original["execute"](wrapper, sql, params)
@@ -323,8 +354,8 @@ def _execute(wrapper, sql, params=None):
         ctx,
         sql=sql,
         encoded_params=encoded_params,
-        query_hash=query_hash,
-        n=n,
+        query_hash=statement_hash,
+        position=position,
     )
     return result
 
@@ -345,25 +376,28 @@ def _executemany(wrapper, sql, param_list):
         ctx.system_statements += 1
         _trace("SYSTEM", ctx.mode, ctx.key, " ".join(sql.split())[:90])
         return _original["executemany"](wrapper, sql, param_list)
+
+    statement_hash = query_hash(sql)
+    position = ctx.next_position()
+    if ctx.mode == REPLAY:
+        record = ctx.store.lookup(ctx.key, position)
+        if record is not None and record.hash == statement_hash:
+            _serve_from_capture(
+                wrapper, ctx, record, sql=sql, query_hash=statement_hash, position=position, kind="REPLAY"
+            )
+            return None
+        if record is not None:
+            ctx.note_changed(position, sql)
+        _note_miss(ctx, sql, position, statement_hash, "CHANGED" if record is not None else "MISS")
+        _reset_buffer(wrapper)
+        return _original["executemany"](wrapper, sql, param_list)
+
     try:
         encoded_params = [encode_params(params) for params in param_list]
-        query_hash = hash_for(sql, encoded_params)
     except UnsupportedValue as exc:
         ctx.note_unsupported(str(exc))
         _reset_buffer(wrapper)
         ctx.db_statements += 1
-        return _original["executemany"](wrapper, sql, param_list)
-
-    n = ctx.next_n(query_hash)
-    if ctx.mode == REPLAY:
-        record = ctx.store.lookup(ctx.key, query_hash, n)
-        if record is not None:
-            _serve_from_capture(
-                wrapper, ctx, record, sql=sql, query_hash=query_hash, n=n, kind="REPLAY"
-            )
-            return None
-        _note_miss(ctx, sql, query_hash, n, "MISS")
-        _reset_buffer(wrapper)
         return _original["executemany"](wrapper, sql, param_list)
 
     result = _original["executemany"](wrapper, sql, param_list)
@@ -371,12 +405,12 @@ def _executemany(wrapper, sql, param_list):
     rowcount = wrapper.cursor.rowcount
     _reset_buffer(wrapper)
     ctx.last_sql = sql
-    _trace("REC", ctx.mode, ctx.key, f"{query_hash[:8]}#{n}", sql.replace("\n", " ")[:90])
+    _trace("REC", ctx.mode, ctx.key, _label(position, statement_hash), sql.replace("\n", " ")[:90])
     record = record_from_db(
         sql=sql,
         encoded_params=encoded_params,
-        query_hash=query_hash,
-        n=n,
+        query_hash=statement_hash,
+        n=position,
         columns=[],
         rows=[],
         rowcount=rowcount,

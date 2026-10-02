@@ -23,7 +23,7 @@ class _Status(str, enum.Enum):
 def record(**overrides) -> Record:
     payload = {
         "hash": "9f2c",
-        "n": 0,
+        "n": 1,
         "sql": "SELECT id, name FROM shop_order WHERE id = %s",
         "params": [{"t": "int", "v": 1}],
         "columns": ["id", "name"],
@@ -42,13 +42,18 @@ def test_the_file_is_a_capture_list_and_a_schema_table():
     payload = payload_of([record()])
     assert list(payload) == ["captures", "schemas"]
     capture = payload["captures"][0]
-    assert list(capture) == ["hash", "n", "sql", "schemas", "params", "rowcount", "columns", "rows"]
+    assert list(capture) == ["n", "hash", "sql", "schemas", "params", "rowcount", "columns", "rows"]
+
+
+def test_the_position_of_a_statement_comes_first():
+    """A capture is read by its position, so the position opens the record."""
+    text = render_capture([record()])
+    assert text.startswith("captures:\n  - n: 1\n    hash: 9f2c\n")
 
 
 def test_a_capture_is_written_under_the_captures_field():
     """A block sequence indented under its own key: a capture reads as a record."""
     text = render_capture([record()])
-    assert text.startswith("captures:\n  - hash: 9f2c\n")
     assert "    schemas: {params: 1, rows: 2}\n" in text
     assert "    params: [1]\n" in text
     assert "    rows:\n      - [1, first]\n" in text
@@ -128,8 +133,8 @@ def test_an_enum_parameter_is_written_as_its_value(tmp_path):
     """``Order.objects.filter(name=OrderStatus.FIRST)`` records a str subclass."""
     params = encode_params([_Status.FIRST])
     statement = Record(
-        hash=query_hash("SELECT id FROM shop_order WHERE name = %s", [_Status.FIRST]),
-        n=0,
+        hash=query_hash("SELECT id FROM shop_order WHERE name = %s"),
+        n=1,
         sql="SELECT id FROM shop_order WHERE name = %s",
         params=params,
         rowcount=1,
@@ -267,7 +272,7 @@ def test_a_precise_type_comes_from_the_schema_not_from_the_data(tmp_path):
 
 def capture(**overrides) -> dict:
     """A capture as a file holds it — built here, not by the writer."""
-    payload = {"hash": "x", "sql": "SELECT 1", "n": 0}
+    payload = {"n": 1, "hash": "x", "sql": "SELECT 1"}
     payload.update(overrides)
     return payload
 
@@ -276,6 +281,13 @@ def broken(path, payload):
     """A file of the shape the assertions below need."""
     Path(path).write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
     return path
+
+
+def test_a_capture_without_a_position_is_reported(tmp_path):
+    """Without a position the record cannot be found by a replay: the file is broken."""
+    path = broken(tmp_path / "broken.yaml", {"captures": [{"hash": "x", "sql": "SELECT 1"}], "schemas": {}})
+    with pytest.raises(CaptureFileError, match="malformed capture"):
+        read_capture(path)
 
 
 def test_a_malformed_capture_is_reported(tmp_path):
