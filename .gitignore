@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+.venv/
+.pytest_cache/
+.coverage
+
+# the demo project is run by the integration tests, its captures are regenerated
+tests/demo_project/captures/
+tests/demo_project/tests/captures/

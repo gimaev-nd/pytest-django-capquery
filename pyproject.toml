@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pytest-django-capquery"
+version = "0.1.0"
+description = "pytest plugin that records SQL queries and their results and replays them on the next run"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "capquery contributors" }]
+keywords = ["pytest", "django", "postgres", "testing", "cache"]
+classifiers = [
+    "Framework :: Pytest",
+    "Framework :: Django",
+    "Framework :: Django :: 4.2",
+    "Framework :: Django :: 5.0",
+    "Framework :: Django :: 5.1",
+    "Framework :: Django :: 5.2",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = [
+    "pytest>=7",
+    "pytest-django>=4.5",
+    "PyYAML>=6",
+]
+
+[project.urls]
+Homepage = "https://github.com/example/pytest-django-capquery"
+
+[project.optional-dependencies]
+dev = [
+    "Django>=4.2,<6",
+    "psycopg[binary]>=3.1",
+    "pytest-xdist>=3.0",
+]
+
+[project.entry-points.pytest11]
+django-capquery = "capquery.plugin"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/capquery"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+markers = [
+    "benchmark: long running benchmark of the replay speedup",
+]
